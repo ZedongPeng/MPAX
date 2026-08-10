@@ -86,6 +86,14 @@ class r2HPDHG(raPDHG):
     eps_feas_polish: float = 1e-06
     infeasibility_detection: bool = True
 
+    def check_config(self, is_lp: bool):
+        if not is_lp:
+            raise ValueError(
+                "r2HPDHG supports LP only (its Qx terms are hardwired to "
+                "zero); use raPDHG for QP."
+            )
+        super().check_config(is_lp)
+
     def take_step(
         self, solver_state: PdhgSolverState, problem: QuadraticProgrammingProblem
     ) -> PdhgSolverState:
@@ -149,6 +157,8 @@ class r2HPDHG(raPDHG):
             current_dual_solution=next_dual_solution,
             current_primal_product=next_primal_product,
             current_dual_product=next_dual_product,
+            # Zero by construction: r2HPDHG is LP-only (enforced in
+            # check_config), so Qx == 0 for every iterate.
             current_primal_obj_product=jnp.zeros_like(next_primal_solution),
             initial_primal_solution=solver_state.initial_primal_solution,
             initial_dual_solution=solver_state.initial_dual_solution,
