@@ -197,74 +197,66 @@ def display_problem_details(qp: QuadraticProgrammingProblem) -> None:
             objective_matrix_data = qp.objective_matrix.data
         else:
             objective_matrix_data = qp.objective_matrix
+        col_norms = get_col_l_inf_norms(qp.constraint_matrix)
+        row_norms = get_row_l_inf_norms(qp.constraint_matrix)
+        bound_gaps = qp.variable_upper_bound - qp.variable_lower_bound
+        finite_label = jnp.isfinite(bound_gaps)
+
+        objective_abs = jnp.abs(objective_matrix_data)
+        constraint_abs = jnp.abs(constraint_matrix_data)
+
+        # objective_matrix_data.size is static at trace time (LPs have an
+        # empty objective matrix), so branch in plain Python rather than
+        # trying to select on it with jnp.where.
+        if objective_matrix_data.size == 0:
+            objective_matrix_line = (
+                "Absolute value of objective matrix elements: "
+                "objective matrix is empty (LP)\n"
+            )
+            objective_matrix_args = []
+        else:
+            objective_matrix_line = (
+                "Absolute value of objective matrix elements: "
+                "largest={:.6f}, smallest={:.6f}, avg={:.6f}\n"
+            )
+            objective_matrix_args = [
+                jnp.max(objective_abs, initial=0.0),
+                jnp.min(objective_abs, initial=jnp.inf),
+                jnp.mean(objective_abs, where=objective_abs.size > 0),
+            ]
+
         jax_debug_log(
-            "There are {:d} variables, {:d} constraints (including {:d} equalities) and {:d} nonzero coefficients.",
+            "There are {:d} variables, {:d} constraints (including {:d} "
+            "equalities) and {:d} nonzero coefficients.\n"
+            "Absolute value of nonzero constraint matrix elements: "
+            "largest={:.6f}, smallest={:.6f}, avg={:.6f}\n"
+            "Constraint matrix, infinity norm: max_col={:.6f}, "
+            "min_col={:.6f}, max_row={:.6f}, min_row={:.6f}\n"
+            + objective_matrix_line
+            + "Absolute value of objective vector elements: "
+            "largest={:.6f}, smallest={:.6f}, avg={:.6f}\n"
+            "Absolute value of rhs vector elements: "
+            "largest={:.6f}, smallest={:.6f}, avg={:.6f}\n"
+            "Gap between upper and lower bounds: # finite={:d} of {:d}, "
+            "largest={:f}, smallest={:f}, avg={:f}",
             qp.num_variables,
             qp.num_constraints,
             qp.num_equalities,
             constraint_matrix_nnz_count,
-            logger=logger,
-            level=logging.INFO,
-        )
-
-        jax_debug_log(
-            "Absolute value of nonzero constraint matrix elements:\n"
-            "  largest={:.6f}, smallest={:.6f}, avg={:.6f}",
-            jnp.max(jnp.abs(constraint_matrix_data), initial=0),
-            jnp.min(jnp.abs(constraint_matrix_data), initial=0),
-            jnp.mean(jnp.abs(constraint_matrix_data)),
-            logger=logger,
-            level=logging.INFO,
-        )
-
-        col_norms = get_col_l_inf_norms(qp.constraint_matrix)
-        row_norms = get_row_l_inf_norms(qp.constraint_matrix)
-        jax_debug_log(
-            "Constraint matrix, infinity norm:\n"
-            "  max_col={:.6f}, min_col={:.6f}, max_row={:.6f}, min_row={:.6f}",
+            jnp.max(constraint_abs, initial=0.0),
+            jnp.min(constraint_abs, initial=jnp.inf),
+            jnp.mean(constraint_abs, where=constraint_abs.size > 0),
             jnp.max(col_norms),
             jnp.min(col_norms),
             jnp.max(row_norms),
             jnp.min(row_norms),
-            logger=logger,
-            level=logging.INFO,
-        )
-
-        jax_debug_log(
-            "Absolute value of objective matrix elements:"
-            "  largest={:.6f}, smallest={:.6f}, avg={:.6f}",
-            jnp.max(jnp.abs(objective_matrix_data), initial=0),
-            jnp.min(jnp.abs(objective_matrix_data), initial=0),
-            jnp.mean(jnp.abs(objective_matrix_data)),
-            logger=logger,
-            level=logging.INFO,
-        )
-
-        jax_debug_log(
-            "Absolute value of objective vector elements:\n"
-            "  largest={:.6f}, smallest={:.6f}, avg={:.6f}",
+            *objective_matrix_args,
             jnp.max(jnp.abs(qp.objective_vector)),
             jnp.min(jnp.abs(qp.objective_vector)),
             jnp.mean(jnp.abs(qp.objective_vector)),
-            logger=logger,
-            level=logging.INFO,
-        )
-
-        jax_debug_log(
-            "Absolute value of rhs vector elements:\n"
-            "  largest={:.6f}, smallest={:.6f}, avg={:.6f}",
             jnp.max(jnp.abs(qp.right_hand_side)),
             jnp.min(jnp.abs(qp.right_hand_side)),
             jnp.mean(jnp.abs(qp.right_hand_side)),
-            logger=logger,
-            level=logging.INFO,
-        )
-
-        bound_gaps = qp.variable_upper_bound - qp.variable_lower_bound
-        finite_label = jnp.isfinite(bound_gaps)
-        jax_debug_log(
-            "Gap between upper and lower bounds:\n"
-            "  # finite= {:d} of {:d}, largest= {:f}, smallest= {:f}, avg= {:f}",
             jnp.sum(finite_label),
             len(bound_gaps),
             jnp.max(bound_gaps, initial=jnp.nan, where=finite_label),
