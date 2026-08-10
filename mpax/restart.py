@@ -3,10 +3,7 @@ import logging
 import jax
 from jax import numpy as jnp
 
-from mpax.iteration_stats_utils import (
-    compute_dual_objective,
-    compute_reduced_costs_from_primal_gradient,
-)
+from mpax.iteration_stats_utils import compute_kkt_components
 from mpax.solver_log import jax_debug_log
 from mpax.utils import (
     PdhgSolverState,
@@ -135,65 +132,26 @@ def compute_weight_kkt_residual(
     float
         The weighted KKT residual.
     """
-    lower_variable_violation = jnp.maximum(
-        problem.variable_lower_bound - primal_iterate, 0.0
-    )
-    upper_variable_violation = jnp.maximum(
-        primal_iterate - problem.variable_upper_bound, 0.0
-    )
-
-    constraint_violation = jax.lax.select(
-        problem.equalities_mask,
-        problem.right_hand_side - primal_product,
-        jnp.maximum(problem.right_hand_side - primal_product, 0.0),
-    )
-
-    primal_objective = (
-        problem.objective_constant
-        + jnp.dot(problem.objective_vector, primal_iterate)
-        + 0.5 * jnp.dot(primal_iterate, primal_obj_product)
-    )
-    primal_residual_norm = jnp.linalg.norm(
-        jnp.concatenate(
-            [constraint_violation, lower_variable_violation, upper_variable_violation]
-        ),
-        ord=norm_ord,
-    )
-    relative_primal_residual_norm = primal_residual_norm / (
-        1
-        + jnp.maximum(
-            jnp.linalg.norm(problem.right_hand_side, ord=norm_ord),
-            jnp.linalg.norm(primal_product, ord=norm_ord),
-        )
-    )
-
-    reduced_costs, reduced_costs_violation = compute_reduced_costs_from_primal_gradient(
-        problem.objective_vector - dual_product,
-        problem.isfinite_variable_lower_bound,
-        problem.isfinite_variable_upper_bound,
-    )
-    dual_objective = compute_dual_objective(
-        problem.variable_lower_bound,
-        problem.variable_upper_bound,
-        reduced_costs,
-        problem.right_hand_side,
+    (
+        primal_residual_norm,
+        dual_residual_norm,
+        primal_objective,
+        dual_objective,
+    ) = compute_kkt_components(
+        problem,
         primal_iterate,
         dual_iterate,
+        primal_product,
+        dual_product,
         primal_obj_product,
-        problem.objective_constant,
+        norm_ord,
     )
-
-    dual_residual = jnp.where(
-        problem.inequalities_mask, jnp.maximum(-dual_iterate, 0.0), 0.0
+    denominator = 1 + jnp.maximum(
+        jnp.linalg.norm(problem.right_hand_side, ord=norm_ord),
+        jnp.linalg.norm(primal_product, ord=norm_ord),
     )
-    dual_residual_norm = jnp.linalg.norm(dual_residual, ord=norm_ord)
-    relative_dual_residual_norm = dual_residual_norm / (
-        1
-        + jnp.maximum(
-            jnp.linalg.norm(problem.right_hand_side, ord=norm_ord),
-            jnp.linalg.norm(primal_product, ord=norm_ord),
-        )
-    )
+    relative_primal_residual_norm = primal_residual_norm / denominator
+    relative_dual_residual_norm = dual_residual_norm / denominator
     absolute_gap = jnp.abs(primal_objective - dual_objective)
     relative_gap = absolute_gap / (
         1 + jnp.maximum(jnp.abs(primal_objective), jnp.abs(dual_objective))

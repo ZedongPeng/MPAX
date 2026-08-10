@@ -129,6 +129,81 @@ def compute_reduced_costs_from_primal_gradient(
     return reduced_costs, reduced_costs_violation
 
 
+def compute_kkt_components(
+    problem,
+    primal_iterate,
+    dual_iterate,
+    primal_product,
+    dual_product,
+    primal_obj_product,
+    norm_ord,
+):
+    """Shared KKT residual components for convergence stats and restart.
+
+    Single source of truth: the restart metric previously recomputed these
+    with two defects (gradient missing + primal_obj_product; dual residual
+    missing the reduced-cost violation, leaving it identically zero for
+    projected iterates).
+
+    Returns
+    -------
+    tuple
+        (primal_residual_norm, dual_residual_norm,
+         primal_objective, dual_objective)
+    """
+    lower_variable_violation = jnp.maximum(
+        problem.variable_lower_bound - primal_iterate, 0.0
+    )
+    upper_variable_violation = jnp.maximum(
+        primal_iterate - problem.variable_upper_bound, 0.0
+    )
+    constraint_violation = jax.lax.select(
+        problem.equalities_mask,
+        problem.right_hand_side - primal_product,
+        jnp.maximum(problem.right_hand_side - primal_product, 0.0),
+    )
+    primal_residual_norm = jnp.linalg.norm(
+        jnp.concatenate(
+            [constraint_violation, lower_variable_violation, upper_variable_violation]
+        ),
+        ord=norm_ord,
+    )
+
+    primal_objective = (
+        problem.objective_constant
+        + jnp.dot(problem.objective_vector, primal_iterate)
+        + 0.5 * jnp.dot(primal_iterate, primal_obj_product)
+    )
+
+    reduced_costs, reduced_costs_violation = compute_reduced_costs_from_primal_gradient(
+        problem.objective_vector - dual_product + primal_obj_product,
+        problem.isfinite_variable_lower_bound,
+        problem.isfinite_variable_upper_bound,
+    )
+    dual_objective = compute_dual_objective(
+        problem.variable_lower_bound,
+        problem.variable_upper_bound,
+        reduced_costs,
+        problem.right_hand_side,
+        primal_iterate,
+        dual_iterate,
+        primal_obj_product,
+        problem.objective_constant,
+    )
+    dual_residual = jnp.where(
+        problem.inequalities_mask, jnp.maximum(-dual_iterate, 0.0), 0.0
+    )
+    dual_residual_norm = jnp.linalg.norm(
+        jnp.concatenate([dual_residual, reduced_costs_violation]), ord=norm_ord
+    )
+    return (
+        primal_residual_norm,
+        dual_residual_norm,
+        primal_objective,
+        dual_objective,
+    )
+
+
 # Note: the order of the calculations can be improved.
 def compute_convergence_information(
     problem: QuadraticProgrammingProblem,
@@ -185,53 +260,21 @@ def compute_convergence_information(
     ConvergenceInformation
         Computed convergence information.
     """
-    lower_variable_violation = jnp.maximum(
-        problem.variable_lower_bound - primal_iterate, 0.0
-    )
-    upper_variable_violation = jnp.maximum(
-        primal_iterate - problem.variable_upper_bound, 0.0
-    )
-
-    constraint_violation = jax.lax.select(
-        problem.equalities_mask,
-        problem.right_hand_side - primal_product,
-        jnp.maximum(problem.right_hand_side - primal_product, 0.0),
-    )
-
-    primal_objective = (
-        problem.objective_constant
-        + jnp.dot(problem.objective_vector, primal_iterate)
-        + 0.5 * jnp.dot(primal_iterate, primal_obj_product)
-    )
-
-    violation_info = jnp.concatenate(
-        [constraint_violation, lower_variable_violation, upper_variable_violation]
-    )
-    primal_residual_norm = jnp.linalg.norm(violation_info, ord=norm_ord)
-    primal_solution_norm = jnp.linalg.norm(primal_iterate, ord=norm_ord)
-
-    reduced_costs, reduced_costs_violation = compute_reduced_costs_from_primal_gradient(
-        problem.objective_vector - dual_product + primal_obj_product,
-        problem.isfinite_variable_lower_bound,
-        problem.isfinite_variable_upper_bound,
-    )
-
-    dual_objective = compute_dual_objective(
-        problem.variable_lower_bound,
-        problem.variable_upper_bound,
-        reduced_costs,
-        problem.right_hand_side,
+    (
+        primal_residual_norm,
+        dual_residual_norm,
+        primal_objective,
+        dual_objective,
+    ) = compute_kkt_components(
+        problem,
         primal_iterate,
         dual_iterate,
+        primal_product,
+        dual_product,
         primal_obj_product,
-        problem.objective_constant,
+        norm_ord,
     )
-    dual_residual = jnp.where(
-        problem.inequalities_mask, jnp.maximum(-dual_iterate, 0.0), 0.0
-    )
-    dual_residual_norm = jnp.linalg.norm(
-        jnp.concatenate([dual_residual, reduced_costs_violation]), ord=norm_ord
-    )
+    primal_solution_norm = jnp.linalg.norm(primal_iterate, ord=norm_ord)
     dual_solution_norm = jnp.linalg.norm(dual_iterate, ord=norm_ord)
     relative_primal_residual_norm = primal_residual_norm / (
         eps_ratio
