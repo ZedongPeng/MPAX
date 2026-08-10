@@ -2,7 +2,7 @@ import timeit
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Dict, List, NamedTuple, Optional, Union
+from typing import Dict, NamedTuple, Optional, Union
 import functools
 from jax.tree_util import register_dataclass
 
@@ -187,15 +187,6 @@ class QuadraticProgrammingProblem:
     constraint_lower_bound: jnp.ndarray
     constraint_upper_bound: jnp.ndarray
     is_lp: bool
-
-
-class PresolveInfo(NamedTuple):
-    original_primal_size: int
-    original_dual_size: int
-    empty_rows: List[int]
-    empty_columns: List[int]
-    variable_lower_bound: jnp.ndarray
-    variable_upper_bound: jnp.ndarray
 
 
 class RestartScheme(IntEnum):
