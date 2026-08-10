@@ -10,6 +10,7 @@ from mpax.utils import (
     TerminationStatus,
     TimingData,
     combined_constraint_bounds,
+    safe_norm,
 )
 
 logger = logging.getLogger(__name__)
@@ -464,7 +465,9 @@ def pdhg_final_log(
             "  dual norms:   L1={:15.10g}, L2={:15.10g}, Linf={:15.10g}",
             jnp.linalg.norm(avg_dual_solution, 1),
             jnp.linalg.norm(avg_dual_solution),
-            jnp.linalg.norm(avg_dual_solution, jnp.inf),
+            # avg_dual_solution is m-length: safe_norm avoids the
+            # zero-size-array crash on m = 0 problems (issue #27).
+            safe_norm(avg_dual_solution, jnp.inf),
             logger=logger,
             level=logging.INFO,
         )
@@ -515,15 +518,28 @@ def pdhg_final_log(
         constraint_hardness = row_norms * jnp.abs(avg_dual_solution)
         col_norms = get_col_l2_norms(problem.constraint_matrix)
         variable_hardness = col_norms * jnp.abs(avg_primal_solution)
-        jax_debug_log(
-            "Constraint hardness: median_hardness={:f}, mean_hardness={:f}, quantile_99={:f}, hardest={:f}",
-            jnp.median(constraint_hardness),
-            jnp.mean(constraint_hardness),
-            jnp.quantile(constraint_hardness, 0.99),
-            jnp.max(constraint_hardness),
-            logger=logger,
-            level=logging.DEBUG,
-        )
+        # constraint_hardness is m-length: jnp.max has no identity and
+        # jnp.median/jnp.quantile are undefined on an empty array, so
+        # m = 0 problems (issue #27) need a static-size Python branch
+        # here rather than the reductions below. Array sizes are static
+        # under tracing, so this eager check is safe even when debug
+        # logging runs inside a traced call.
+        if constraint_hardness.size == 0:
+            jax_debug_log(
+                "Constraint hardness: no constraints (m = 0)",
+                logger=logger,
+                level=logging.DEBUG,
+            )
+        else:
+            jax_debug_log(
+                "Constraint hardness: median_hardness={:f}, mean_hardness={:f}, quantile_99={:f}, hardest={:f}",
+                jnp.median(constraint_hardness),
+                jnp.mean(constraint_hardness),
+                jnp.quantile(constraint_hardness, 0.99),
+                jnp.max(constraint_hardness),
+                logger=logger,
+                level=logging.DEBUG,
+            )
         jax_debug_log(
             "Variable hardness: median_hardness={:f}, mean_hardness={:f}, quantile_99={:f}, hardest={:f}",
             jnp.median(variable_hardness),

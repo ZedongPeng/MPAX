@@ -1,3 +1,4 @@
+import jax
 import jax.numpy as jnp
 import pytest
 from jax import config
@@ -61,6 +62,32 @@ def test_box_lp_no_constraints_r2hpdhg():
     result = r2HPDHG(eps_abs=1e-8, eps_rel=1e-8).optimize(lp)
     assert result.termination_status == TerminationStatus.OPTIMAL
     assert pytest.approx(float(result.primal_objective), abs=1e-4) == -2.0
+
+
+def test_box_lp_no_constraints_verbose_logging(capsys):
+    # Issue #27 follow-up: verbose/debug final-log norms (Linf on the
+    # m = 0 dual vector, and the DEBUG constraint-hardness reduction) must
+    # not crash with "zero-size array to reduction operation max which has
+    # no identity". setup_logger (invoked by raPDHG.optimize) clears root
+    # handlers and attaches its own StreamHandler, so caplog never observes
+    # the records; capture stderr directly instead, following
+    # tests/solver_log_test.py's pattern.
+    lp = create_lp(
+        jnp.array([1.0, -2.0]),
+        jnp.zeros((0, 2)),
+        jnp.zeros(0),
+        jnp.zeros(0),
+        jnp.zeros(2),
+        jnp.ones(2),
+        use_sparse_matrix=False,
+    )
+    result = raPDHG(eps_abs=1e-8, eps_rel=1e-8, verbose=True, debug=True).optimize(lp)
+    jax.effects_barrier()
+    assert result.termination_status == TerminationStatus.OPTIMAL
+    assert pytest.approx(float(result.primal_objective), abs=1e-4) == -2.0
+    captured = capsys.readouterr()
+    assert "dual norms" in captured.err
+    assert "Constraint hardness" in captured.err
 
 
 def test_create_lp_rejects_wrong_objective_length():
