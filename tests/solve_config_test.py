@@ -16,8 +16,9 @@ def _tiny_qp():
     G = jnp.ones((1, 2))
     lc = jnp.ones(1)
     uc = jnp.array([jnp.inf])
-    return create_qp(Q, c, G, lc, uc, jnp.zeros(2), jnp.ones(2),
-                     use_sparse_matrix=False)
+    return create_qp(
+        Q, c, G, lc, uc, jnp.zeros(2), jnp.ones(2), use_sparse_matrix=False
+    )
 
 
 def _tiny_lp():
@@ -26,8 +27,7 @@ def _tiny_lp():
     G = jnp.ones((1, 2))
     lc = jnp.ones(1)
     uc = jnp.array([jnp.inf])
-    return create_lp(c, G, lc, uc, jnp.zeros(2), jnp.ones(2),
-                     use_sparse_matrix=False)
+    return create_lp(c, G, lc, uc, jnp.zeros(2), jnp.ones(2), use_sparse_matrix=False)
 
 
 def test_qp_solve_does_not_mutate_config():

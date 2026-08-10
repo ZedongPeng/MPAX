@@ -34,7 +34,9 @@ def test_standard_form_wrapper_matches_two_sided():
 
     r_old = raPDHG(eps_abs=1e-6, eps_rel=1e-6).optimize(lp_old)
     r_new = raPDHG(eps_abs=1e-6, eps_rel=1e-6).optimize(lp_new)
-    # Identical problem data => identical trajectory: the Stage-3 gate.
+    # The wrapper must produce bit-identical problem data, hence an
+    # identical trajectory. (The pre- vs post-migration behavior gate is
+    # the benchmark compare against the stage-1 baseline, not this test.)
     assert r_old.iteration_count == r_new.iteration_count
     assert jnp.allclose(r_old.primal_solution, r_new.primal_solution)
     assert r_old.termination_status == TerminationStatus.OPTIMAL
@@ -44,8 +46,13 @@ def test_genuinely_two_sided_row():
     # min x1 + 2 x2  s.t.  1 <= x1 + x2 <= 2,  0 <= x <= 3   => x = (1, 0)
     A = jnp.array([[1.0, 1.0]])
     lp = create_lp(
-        jnp.array([1.0, 2.0]), A, jnp.array([1.0]), jnp.array([2.0]),
-        jnp.zeros(2), 3.0 * jnp.ones(2), use_sparse_matrix=False,
+        jnp.array([1.0, 2.0]),
+        A,
+        jnp.array([1.0]),
+        jnp.array([2.0]),
+        jnp.zeros(2),
+        3.0 * jnp.ones(2),
+        use_sparse_matrix=False,
     )
     result = raPDHG(eps_abs=1e-8, eps_rel=1e-8).optimize(lp)
     assert result.termination_status == TerminationStatus.OPTIMAL
@@ -56,8 +63,13 @@ def test_leq_row_negative_dual():
     # max x1 + x2 (= min -x1 - x2)  s.t. x1 + x2 <= 1,  0 <= x <= 1
     A = jnp.array([[1.0, 1.0]])
     lp = create_lp(
-        jnp.array([-1.0, -1.0]), A, jnp.array([-jnp.inf]), jnp.array([1.0]),
-        jnp.zeros(2), jnp.ones(2), use_sparse_matrix=False,
+        jnp.array([-1.0, -1.0]),
+        A,
+        jnp.array([-jnp.inf]),
+        jnp.array([1.0]),
+        jnp.zeros(2),
+        jnp.ones(2),
+        use_sparse_matrix=False,
     )
     result = raPDHG(eps_abs=1e-8, eps_rel=1e-8).optimize(lp)
     assert result.termination_status == TerminationStatus.OPTIMAL
@@ -75,7 +87,12 @@ def test_free_row_gets_zero_dual():
     lc = jnp.array([1.0, -jnp.inf])
     uc = jnp.array([jnp.inf, jnp.inf])
     lp = create_lp(
-        jnp.array([1.0, 2.0]), A, lc, uc, jnp.zeros(2), jnp.ones(2),
+        jnp.array([1.0, 2.0]),
+        A,
+        lc,
+        uc,
+        jnp.zeros(2),
+        jnp.ones(2),
         use_sparse_matrix=False,
     )
     result = raPDHG(eps_abs=1e-8, eps_rel=1e-8).optimize(lp)

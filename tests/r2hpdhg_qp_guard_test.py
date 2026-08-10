@@ -12,8 +12,9 @@ def _tiny_qp():
     G = jnp.ones((1, 2))
     lc = jnp.ones(1)
     uc = jnp.array([jnp.inf])
-    return create_qp(Q, c, G, lc, uc, jnp.zeros(2), jnp.ones(2),
-                     use_sparse_matrix=False)
+    return create_qp(
+        Q, c, G, lc, uc, jnp.zeros(2), jnp.ones(2), use_sparse_matrix=False
+    )
 
 
 def test_r2hpdhg_rejects_qp():
