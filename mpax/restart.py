@@ -687,6 +687,7 @@ def run_restart_scheme_feasibility_polishing(
     restart_solver_state: PdhgSolverState,
     last_restart_info: RestartInfo,
     restart_params: RestartParameters,
+    norm_ord: float,
 ):
     """
     Check restart criteria based on current and average KKT residuals.
@@ -703,6 +704,8 @@ def run_restart_scheme_feasibility_polishing(
         Information from the last restart.
     restart_params : RestartParameters
         Parameters for controlling restart behavior.
+    norm_ord : float
+        Order of the norm.
 
     Returns
     -------
@@ -714,7 +717,7 @@ def run_restart_scheme_feasibility_polishing(
         restart_solver_state.solutions_count == 0,
         lambda: (False, False, last_restart_info.reduction_ratio_last_trial),
         lambda: restart_criteria_met_kkt(
-            restart_params, problem, restart_solver_state, last_restart_info
+            restart_params, problem, restart_solver_state, last_restart_info, norm_ord
         ),
     )
     return jax.lax.cond(

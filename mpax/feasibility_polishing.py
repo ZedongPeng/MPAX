@@ -1,24 +1,56 @@
+from dataclasses import replace as dataclass_replace
+
 from jax.lax import cond
 import jax.numpy as jnp
+from jax.experimental.sparse import BCOO, BCSR
 from mpax.utils import ScaledQpProblem, RestartInfo
 from mpax.restart import select_initial_primal_weight
+
+
+def zeros_like_matrix(matrix):
+    """Build an all-zero matrix with the same type, shape and sparsity structure.
+
+    The sparsity pattern is preserved rather than dropped so that the polishing
+    problem keeps the same pytree structure as the original one, which jit
+    requires.
+    """
+    if isinstance(matrix, BCOO):
+        return BCOO(
+            (jnp.zeros_like(matrix.data), matrix.indices),
+            shape=matrix.shape,
+            indices_sorted=matrix.indices_sorted,
+            unique_indices=matrix.unique_indices,
+        )
+    elif isinstance(matrix, BCSR):
+        return BCSR(
+            (jnp.zeros_like(matrix.data), matrix.indices, matrix.indptr),
+            shape=matrix.shape,
+        )
+    return jnp.zeros_like(matrix)
 
 
 def init_primal_feasibility_polishing(
     scaled_problem, solver_state, initial_primal_weight, average=True
 ):
-    zero_objective_matrix = jnp.zeros_like(scaled_problem.original_qp.objective_matrix)
+    zero_objective_matrix = zeros_like_matrix(
+        scaled_problem.original_qp.objective_matrix
+    )
+    zero_scaled_objective_matrix = zeros_like_matrix(
+        scaled_problem.scaled_qp.objective_matrix
+    )
     zero_objective_vector = jnp.zeros_like(scaled_problem.original_qp.objective_vector)
     primal_feasibility_problem = ScaledQpProblem(
-        original_qp=scaled_problem.original_qp.replace(
+        original_qp=dataclass_replace(
+            scaled_problem.original_qp,
             objective_matrix=zero_objective_matrix,
             objective_vector=zero_objective_vector,
-            objective_constant=0,
+            objective_constant=0.0,
         ),
-        scaled_qp=scaled_problem.scaled_qp.replace(
-            objective_matrix=zero_objective_matrix,
+        scaled_qp=dataclass_replace(
+            scaled_problem.scaled_qp,
+            objective_matrix=zero_scaled_objective_matrix,
             objective_vector=zero_objective_vector,
-            objective_constant=0,
+            objective_constant=0.0,
         ),
         constraint_rescaling=scaled_problem.constraint_rescaling,
         variable_rescaling=scaled_problem.variable_rescaling,
@@ -61,6 +93,7 @@ def init_primal_feasibility_polishing(
         primal_diff_product=jnp.zeros_like(solver_state.current_primal_product),
         primal_product=primal_product,
         dual_product=jnp.zeros_like(solver_state.current_dual_product),
+        primal_obj_product=jnp.zeros_like(solver_state.current_primal_obj_product),
     )
     return (
         primal_feasibility_problem,
@@ -87,7 +120,8 @@ def init_dual_feasibility_polishing(
     scaled_problem, solver_state, initial_primal_weight, average=True
 ):
     dual_feasibility_problem = ScaledQpProblem(
-        original_qp=scaled_problem.original_qp.replace(
+        original_qp=dataclass_replace(
+            scaled_problem.original_qp,
             variable_lower_bound=jnp.where(
                 scaled_problem.original_qp.isfinite_variable_lower_bound,
                 0.0,
@@ -98,9 +132,12 @@ def init_dual_feasibility_polishing(
                 0.0,
                 scaled_problem.original_qp.variable_upper_bound,
             ),
-            right_hand_side=jnp.zeros_like(scaled_problem.original_qp.right_hand_side),
+            right_hand_side=jnp.zeros_like(
+                scaled_problem.original_qp.right_hand_side
+            ),
         ),
-        scaled_qp=scaled_problem.scaled_qp.replace(
+        scaled_qp=dataclass_replace(
+            scaled_problem.scaled_qp,
             variable_lower_bound=jnp.where(
                 scaled_problem.scaled_qp.isfinite_variable_lower_bound,
                 0.0,
@@ -111,7 +148,9 @@ def init_dual_feasibility_polishing(
                 0.0,
                 scaled_problem.scaled_qp.variable_upper_bound,
             ),
-            right_hand_side=jnp.zeros_like(scaled_problem.scaled_qp.right_hand_side),
+            right_hand_side=jnp.zeros_like(
+                scaled_problem.scaled_qp.right_hand_side
+            ),
         ),
         constraint_rescaling=scaled_problem.constraint_rescaling,
         variable_rescaling=scaled_problem.variable_rescaling,
@@ -156,6 +195,7 @@ def init_dual_feasibility_polishing(
         primal_diff_product=jnp.zeros_like(solver_state.current_primal_product),
         primal_product=jnp.zeros_like(solver_state.current_primal_product),
         dual_product=dual_product,
+        primal_obj_product=jnp.zeros_like(solver_state.current_primal_obj_product),
     )
 
     return dual_feasibility_problem, dual_feasibility_solver_state, last_restart_info

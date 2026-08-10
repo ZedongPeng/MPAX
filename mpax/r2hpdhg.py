@@ -506,7 +506,6 @@ class r2HPDHG(raPDHG):
             self._polishing_termination_criteria,
             qp_cache,
             1.0,
-            self.termination_evaluation_frequency * self.display_frequency,
             self.optimality_norm,
             average=False,
         )
@@ -589,7 +588,6 @@ class r2HPDHG(raPDHG):
             self._polishing_termination_criteria,
             qp_cache,
             1.0,
-            self.termination_evaluation_frequency * self.display_frequency,
             self.optimality_norm,
             average=False,
         )
@@ -717,7 +715,7 @@ class r2HPDHG(raPDHG):
                 / scaled_problem.variable_rescaling,
                 solver_state.current_dual_solution
                 / scaled_problem.constraint_rescaling,
-                self.abs_rel / self.rel_eps,
+                self.eps_abs / self.eps_rel,
                 solver_state.current_primal_product
                 * scaled_problem.constraint_rescaling,
                 solver_state.current_dual_product * scaled_problem.variable_rescaling,
