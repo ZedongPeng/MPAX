@@ -13,6 +13,7 @@ from mpax.utils import (
     PdhgSolverState,
     ScaledQpProblem,
     combined_constraint_bounds,
+    safe_norm,
 )
 
 
@@ -58,7 +59,7 @@ def cached_quadratic_program_info(
     """
     return CachedQuadraticProgramInfo(
         jnp.linalg.norm(qp.objective_vector, ord=norm_ord),
-        jnp.linalg.norm(combined_constraint_bounds(qp), ord=norm_ord),
+        safe_norm(combined_constraint_bounds(qp), ord=norm_ord),
     )
 
 

@@ -77,6 +77,34 @@ def transform_to_jnp_array(input_matrix):
     return output_matrix
 
 
+def _validate_dimensions(c, A, lc, uc, l, u, Q=None):
+    """Shape-consistency checks with readable errors (issue #27).
+
+    Only static shapes are inspected, so this is safe for traced inputs
+    under jit/vmap. Data-dependent validity (lc <= uc, no NaNs) is NOT
+    checked here — it cannot raise a Python error at trace time.
+    """
+    n = c.shape[0]
+    if A.shape[1] != n:
+        raise ValueError(
+            f"constraint matrix has {A.shape[1]} columns but the "
+            f"objective vector has {n} entries"
+        )
+    m = A.shape[0]
+    if lc.shape[0] != m or uc.shape[0] != m:
+        raise ValueError(
+            f"constraint bounds have lengths {lc.shape[0]} (lower) and "
+            f"{uc.shape[0]} (upper) but the constraint matrix has {m} rows"
+        )
+    if l.shape[0] != n or u.shape[0] != n:
+        raise ValueError(
+            f"variable bounds have lengths {l.shape[0]} (lower) and "
+            f"{u.shape[0]} (upper) but the objective vector has {n} entries"
+        )
+    if Q is not None and Q.shape != (n, n):
+        raise ValueError(f"objective matrix has shape {Q.shape}; expected ({n}, {n})")
+
+
 def create_lp(c, A, lc, uc, l, u, use_sparse_matrix=True):
     """Create a boxed linear program with two-sided constraints.
             min  c'x
@@ -108,6 +136,7 @@ def create_lp(c, A, lc, uc, l, u, use_sparse_matrix=True):
     QuadraticProgrammingProblem
         The boxed linear program.
     """
+    _validate_dimensions(c, A, lc, uc, l, u)
     if use_sparse_matrix:
         constraint_matrix = transform_to_bcoo(A)
     else:
@@ -141,6 +170,7 @@ def create_qp(Q, c, A, lc, uc, l, u, use_sparse_matrix=True):
     the positive semidefinite quadratic objective matrix. A Q with no
     nonzeros produces an LP (objective_matrix None, is_lp True).
     """
+    _validate_dimensions(c, A, lc, uc, l, u, Q=Q)
     if use_sparse_matrix:
         constraint_matrix = transform_to_bcoo(A)
         objective_matrix = transform_to_bcoo(Q)

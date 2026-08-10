@@ -13,6 +13,7 @@ from mpax.utils import (
     PointType,
     QuadraticProgrammingProblem,
     ScaledQpProblem,
+    safe_norm,
 )
 
 
@@ -256,12 +257,11 @@ def compute_convergence_information(
         )
     )
     primal_solution_norm = jnp.linalg.norm(primal_iterate, ord=norm_ord)
-    dual_solution_norm = jnp.linalg.norm(dual_iterate, ord=norm_ord)
+    dual_solution_norm = safe_norm(dual_iterate, ord=norm_ord)
     relative_primal_residual_norm = primal_residual_norm / (
         eps_ratio
         + jnp.maximum(
-            qp_cache.constraint_bound_norm,
-            jnp.linalg.norm(primal_product, ord=norm_ord),
+            qp_cache.constraint_bound_norm, safe_norm(primal_product, ord=norm_ord)
         )
     )
     relative_dual_residual_norm = dual_residual_norm / (

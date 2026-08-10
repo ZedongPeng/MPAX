@@ -704,3 +704,15 @@ def combined_constraint_bounds(problem):
     return jnp.where(
         jnp.abs(lower_finite) > jnp.abs(upper_finite), lower_finite, upper_finite
     )
+
+
+def safe_norm(x, ord=None):
+    """jnp.linalg.norm that is defined for zero-size inputs.
+
+    Infinity norms reduce with jnp.max, which has no identity element, so
+    m = 0 problems (issue #27) would crash. Array sizes are static under
+    tracing, so the branch is plain Python.
+    """
+    if x.size == 0:
+        return jnp.array(0.0)
+    return jnp.linalg.norm(x, ord=ord)

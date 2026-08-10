@@ -461,11 +461,17 @@ class raPDHG(abc.ABC):
         # Step size computation
         if cfg.adaptive_step_size:
             if isinstance(scaled_qp.constraint_matrix, (BCOO, BCSR)):
-                step_size = 1.0 / jnp.max(jnp.abs(scaled_qp.constraint_matrix.data))
+                matrix_entries = scaled_qp.constraint_matrix.data
             elif isinstance(scaled_qp.constraint_matrix, jnp.ndarray):
-                step_size = 1.0 / jnp.max(jnp.abs(scaled_qp.constraint_matrix))
+                matrix_entries = scaled_qp.constraint_matrix
             else:
                 raise ValueError("Unsupported matrix type.")
+            if matrix_entries.size == 0:
+                # m = 0: no constraint entries to scale against; any
+                # positive step size works (the dual space is empty).
+                step_size = 1.0
+            else:
+                step_size = 1.0 / jnp.max(jnp.abs(matrix_entries))
         else:
             # desired_relative_error = 0.2
             # maximum_singular_value, number_of_power_iterations = (
@@ -476,9 +482,12 @@ class raPDHG(abc.ABC):
             #     )
             # )
             # step_size = (1 - desired_relative_error) / maximum_singular_value
-            self._norm_A = estimate_maximum_singular_value(scaled_qp.constraint_matrix)[
-                0
-            ]
+            if scaled_qp.constraint_matrix.shape[0] == 0:
+                self._norm_A = 0.0
+            else:
+                self._norm_A = estimate_maximum_singular_value(
+                    scaled_qp.constraint_matrix
+                )[0]
             if is_lp:
                 self._norm_Q = 0.0
             else:

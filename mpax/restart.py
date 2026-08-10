@@ -16,6 +16,7 @@ from mpax.utils import (
     ScaledQpProblem,
     TerminationStatus,
     combined_constraint_bounds,
+    safe_norm,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,8 +146,8 @@ def compute_weight_kkt_residual(
         )
     )
     denominator = 1 + jnp.maximum(
-        jnp.linalg.norm(combined_constraint_bounds(problem), ord=norm_ord),
-        jnp.linalg.norm(primal_product, ord=norm_ord),
+        safe_norm(combined_constraint_bounds(problem), ord=norm_ord),
+        safe_norm(primal_product, ord=norm_ord),
     )
     relative_primal_residual_norm = primal_residual_norm / denominator
     relative_dual_residual_norm = dual_residual_norm / denominator

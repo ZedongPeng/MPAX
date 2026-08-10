@@ -147,7 +147,11 @@ def get_row_l_inf_norms(matrix: Union[BCOO, BCSR, jnp.ndarray]) -> jnp.ndarray:
         # Accumulate the max absolute value for each row
         row_norms = row_norms.at[rowval].max(jnp.abs(nzval))
     elif isinstance(matrix, jnp.ndarray):
-        row_norms = jnp.linalg.norm(matrix, ord=jnp.inf, axis=1)
+        # jnp.linalg.norm(..., ord=jnp.inf) reduces with jnp.max, which has
+        # no identity; guard the m = 0 / n = 0 case (issue #27) the same
+        # way as display_problem_details, without changing nonempty results
+        # (jnp.linalg.norm(v, ord=inf) is implemented as max(abs(v))).
+        row_norms = jnp.max(jnp.abs(matrix), axis=1, initial=0.0)
 
     return row_norms
 
@@ -176,7 +180,9 @@ def get_col_l_inf_norms(matrix: Union[BCOO, BCSR, jnp.ndarray]) -> jnp.ndarray:
         # Accumulate the max absolute value for each column
         col_norms = col_norms.at[colval].max(jnp.abs(nzval))
     elif isinstance(matrix, jnp.ndarray):
-        col_norms = jnp.linalg.norm(matrix, ord=jnp.inf, axis=0)
+        # See get_row_l_inf_norms: guard the empty-reduction case (m = 0)
+        # without changing nonempty results.
+        col_norms = jnp.max(jnp.abs(matrix), axis=0, initial=0.0)
 
     return col_norms
 
@@ -260,15 +266,15 @@ def display_problem_details(qp: QuadraticProgrammingProblem) -> None:
             jnp.mean(constraint_abs, where=constraint_abs.size > 0),
             jnp.max(col_norms),
             jnp.min(col_norms),
-            jnp.max(row_norms),
-            jnp.min(row_norms),
+            jnp.max(row_norms, initial=0.0),
+            jnp.min(row_norms, initial=jnp.inf),
             *objective_matrix_args,
             jnp.max(jnp.abs(qp.objective_vector)),
             jnp.min(jnp.abs(qp.objective_vector)),
             jnp.mean(jnp.abs(qp.objective_vector)),
-            jnp.max(jnp.abs(finite_bound_values)),
-            jnp.min(jnp.abs(finite_bound_values)),
-            jnp.mean(jnp.abs(finite_bound_values)),
+            jnp.max(jnp.abs(finite_bound_values), initial=0.0),
+            jnp.min(jnp.abs(finite_bound_values), initial=jnp.inf),
+            jnp.mean(jnp.abs(finite_bound_values), where=finite_bound_values.size > 0),
             jnp.sum(finite_label),
             len(bound_gaps),
             # `initial` is the identity element of the reduction, so it must be
