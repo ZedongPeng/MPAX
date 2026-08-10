@@ -3,6 +3,7 @@
 Usage:
     $PY -m benchmarks.run --out benchmarks/baseline/$(date +%F)-stage1.csv
 """
+
 import argparse
 import csv
 import timeit
@@ -43,15 +44,17 @@ def main():
                 t0 = timeit.default_timer()
                 result = solver.optimize(problem)
                 elapsed = timeit.default_timer() - t0
-                rows.append({
-                    "instance": name,
-                    "solver": solver_name,
-                    "tol": tol,
-                    "status": int(result.termination_status),
-                    "iterations": int(result.iteration_count),
-                    "primal_objective": float(result.primal_objective),
-                    "solve_time_sec": round(elapsed, 3),
-                })
+                rows.append(
+                    {
+                        "instance": name,
+                        "solver": solver_name,
+                        "tol": tol,
+                        "status": int(result.termination_status),
+                        "iterations": int(result.iteration_count),
+                        "primal_objective": float(result.primal_objective),
+                        "solve_time_sec": round(elapsed, 3),
+                    }
+                )
                 print(rows[-1])
 
     with open(args.out, "w", newline="") as f:

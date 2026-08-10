@@ -22,8 +22,7 @@ def test_problem_details_logging_has_values(capsys):
     # capture stderr directly instead.
     model = gp.read(pytest_cache_dir + "/flugpl.mps")
     lp = create_qp_from_gurobi(model)
-    solver = raPDHG(eps_abs=1e-4, eps_rel=1e-4, verbose=True,
-                    iteration_limit=10)
+    solver = raPDHG(eps_abs=1e-4, eps_rel=1e-4, verbose=True, iteration_limit=10)
     solver.optimize(lp)
     jax.effects_barrier()
     captured = capsys.readouterr()

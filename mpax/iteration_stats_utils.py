@@ -196,12 +196,7 @@ def compute_kkt_components(
     dual_residual_norm = jnp.linalg.norm(
         jnp.concatenate([dual_residual, reduced_costs_violation]), ord=norm_ord
     )
-    return (
-        primal_residual_norm,
-        dual_residual_norm,
-        primal_objective,
-        dual_objective,
-    )
+    return (primal_residual_norm, dual_residual_norm, primal_objective, dual_objective)
 
 
 # Note: the order of the calculations can be improved.
@@ -260,19 +255,16 @@ def compute_convergence_information(
     ConvergenceInformation
         Computed convergence information.
     """
-    (
-        primal_residual_norm,
-        dual_residual_norm,
-        primal_objective,
-        dual_objective,
-    ) = compute_kkt_components(
-        problem,
-        primal_iterate,
-        dual_iterate,
-        primal_product,
-        dual_product,
-        primal_obj_product,
-        norm_ord,
+    (primal_residual_norm, dual_residual_norm, primal_objective, dual_objective) = (
+        compute_kkt_components(
+            problem,
+            primal_iterate,
+            dual_iterate,
+            primal_product,
+            dual_product,
+            primal_obj_product,
+            norm_ord,
+        )
     )
     primal_solution_norm = jnp.linalg.norm(primal_iterate, ord=norm_ord)
     dual_solution_norm = jnp.linalg.norm(dual_iterate, ord=norm_ord)

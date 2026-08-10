@@ -1,14 +1,12 @@
 """Compare two benchmark CSVs: python -m benchmarks.compare OLD NEW"""
+
 import csv
 import sys
 
 
 def load(path):
     with open(path) as f:
-        return {
-            (r["instance"], r["solver"], r["tol"]): r
-            for r in csv.DictReader(f)
-        }
+        return {(r["instance"], r["solver"], r["tol"]): r for r in csv.DictReader(f)}
 
 
 def main():

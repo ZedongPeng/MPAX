@@ -132,19 +132,16 @@ def compute_weight_kkt_residual(
     float
         The weighted KKT residual.
     """
-    (
-        primal_residual_norm,
-        dual_residual_norm,
-        primal_objective,
-        dual_objective,
-    ) = compute_kkt_components(
-        problem,
-        primal_iterate,
-        dual_iterate,
-        primal_product,
-        dual_product,
-        primal_obj_product,
-        norm_ord,
+    (primal_residual_norm, dual_residual_norm, primal_objective, dual_objective) = (
+        compute_kkt_components(
+            problem,
+            primal_iterate,
+            dual_iterate,
+            primal_product,
+            dual_product,
+            primal_obj_product,
+            norm_ord,
+        )
     )
     denominator = 1 + jnp.maximum(
         jnp.linalg.norm(problem.right_hand_side, ord=norm_ord),

@@ -49,8 +49,7 @@ def test_feasibility_polishing_runs_and_tightens_residual(solver_cls):
         # Polishing solves the feasibility subproblems to eps_feas_polish=1e-6,
         # so an accepted polished residual must beat the plain 1e-4 solve.
         assert (
-            polished.relative_primal_residual_norm
-            < plain.relative_primal_residual_norm
+            polished.relative_primal_residual_norm < plain.relative_primal_residual_norm
         )
     # Whether the polished pair is accepted or rejected, the returned point
     # must honour the requested tolerances it reports OPTIMAL for.
@@ -65,7 +64,6 @@ def test_feasibility_polishing_qp():
     assert pytest.approx(polished.primal_objective, rel=1e-2) == EXPECTED_QP_OBJ
     if _polish_was_accepted(plain, polished):
         assert (
-            polished.relative_primal_residual_norm
-            < plain.relative_primal_residual_norm
+            polished.relative_primal_residual_norm < plain.relative_primal_residual_norm
         )
     assert polished.relative_optimality_gap < EPS * 1.05

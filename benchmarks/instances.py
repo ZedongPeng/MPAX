@@ -4,6 +4,7 @@ MPS/QPS instances are downloaded on first use into benchmarks/cache/
 (same sources as tests/conftest.py). The synthetic knapsack LP is
 generated deterministically.
 """
+
 import gzip
 import shutil
 import zipfile
