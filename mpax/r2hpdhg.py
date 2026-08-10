@@ -33,6 +33,7 @@ from mpax.utils import (
     RestartScheme,
     RestartToCurrentMetric,
     SaddlePointOutput,
+    SolveConfig,
     TerminationStatus,
     ConvergenceInformation,
 )
@@ -87,16 +88,19 @@ class r2HPDHG(raPDHG):
     eps_feas_polish: float = 1e-06
     infeasibility_detection: bool = True
 
-    def check_config(self, is_lp: bool):
+    def resolve_config(self, is_lp: bool) -> SolveConfig:
         if not is_lp:
             raise ValueError(
                 "r2HPDHG supports LP only (its Qx terms are hardwired to "
                 "zero); use raPDHG for QP."
             )
-        super().check_config(is_lp)
+        return super().resolve_config(is_lp)
 
     def take_step(
-        self, solver_state: PdhgSolverState, problem: QuadraticProgrammingProblem
+        self,
+        solver_state: PdhgSolverState,
+        problem: QuadraticProgrammingProblem,
+        cfg: SolveConfig,
     ) -> PdhgSolverState:
         """
         Take a PDHG step with adaptive step size.
@@ -107,8 +111,10 @@ class r2HPDHG(raPDHG):
             The current state of the solver.
         problem : QuadraticProgrammingProblem
             The problem being solved.
+        cfg : SolveConfig
+            The per-solve configuration derived by `resolve_config`.
         """
-        if self.adaptive_step_size:
+        if cfg.adaptive_step_size:
             (
                 delta_primal,
                 delta_dual,
@@ -159,7 +165,7 @@ class r2HPDHG(raPDHG):
             current_primal_product=next_primal_product,
             current_dual_product=next_dual_product,
             # Zero by construction: r2HPDHG is LP-only (enforced in
-            # check_config), so Qx == 0 for every iterate.
+            # resolve_config), so Qx == 0 for every iterate.
             current_primal_obj_product=jnp.zeros_like(next_primal_solution),
             initial_primal_solution=solver_state.initial_primal_solution,
             initial_dual_solution=solver_state.initial_dual_solution,
@@ -185,7 +191,7 @@ class r2HPDHG(raPDHG):
         )
 
     def perform_restart(
-        self, solver_state, last_restart_info, kkt_reduction_ratio, problem
+        self, solver_state, last_restart_info, kkt_reduction_ratio, problem, cfg
     ):
         # Take a pure PDHG step to get the new solution and set it as the initial solution for the outer iteration.
         # Use the pure PDHG step solution, instead of the Halpen PDHG step solution, as the initial solution for the restart.
@@ -236,7 +242,9 @@ class r2HPDHG(raPDHG):
             num_iterations=solver_state.num_iterations - 1,
             termination_status=TerminationStatus.UNSPECIFIED,
         )
-        restarted_solver_state = self.take_step(last_iteration_solver_state, problem)
+        restarted_solver_state = self.take_step(
+            last_iteration_solver_state, problem, cfg
+        )
         restarted_solver_state.initial_step_size = restarted_solver_state.step_size
         restarted_solver_state.initial_primal_solution = last_iteration_primal_solution
         restarted_solver_state.initial_dual_solution = last_iteration_dual_solution
@@ -277,7 +285,7 @@ class r2HPDHG(raPDHG):
         restarted_solver_state.primal_weight = compute_new_primal_weight(
             new_last_restart_info,
             solver_state.primal_weight,
-            self.primal_weight_update_smoothing,
+            cfg.primal_weight_update_smoothing,
         )
         restarted_solver_state.solutions_count = 0
         restarted_solver_state.weights_sum = 0.0
@@ -289,6 +297,7 @@ class r2HPDHG(raPDHG):
         problem: QuadraticProgrammingProblem,
         solver_state: PdhgSolverState,
         last_restart_info: RestartInfo,
+        cfg: SolveConfig,
     ):
         """
         Check restart criteria based on current and average KKT residuals.
@@ -301,6 +310,8 @@ class r2HPDHG(raPDHG):
             The current solver state.
         last_restart_info : RestartInfo
             Information from the last restart.
+        cfg : SolveConfig
+            The per-solve configuration derived by `resolve_config`.
 
         Returns
         -------
@@ -311,13 +322,13 @@ class r2HPDHG(raPDHG):
             solver_state.solutions_count == 0,
             lambda: (False, last_restart_info.reduction_ratio_last_trial),
             lambda: restart_criteria_met_fixed_point(
-                self._restart_params, solver_state, last_restart_info
+                cfg.restart_params, solver_state, last_restart_info
             ),
         )
         return cond(
             do_restart,
             lambda: self.perform_restart(
-                solver_state, last_restart_info, kkt_reduction_ratio, problem
+                solver_state, last_restart_info, kkt_reduction_ratio, problem, cfg
             ),
             lambda: (solver_state, last_restart_info),
         )
@@ -328,6 +339,7 @@ class r2HPDHG(raPDHG):
         current_solver_state: PdhgSolverState,
         restart_solver_state: PdhgSolverState,
         last_restart_info: RestartInfo,
+        cfg: SolveConfig,
     ):
         """
         Check restart criteria based on current and average KKT residuals.
@@ -340,6 +352,8 @@ class r2HPDHG(raPDHG):
             The current solver state.
         last_restart_info : RestartInfo
             Information from the last restart.
+        cfg : SolveConfig
+            The per-solve configuration derived by `resolve_config`.
 
         Returns
         -------
@@ -350,19 +364,24 @@ class r2HPDHG(raPDHG):
             restart_solver_state.solutions_count == 0,
             lambda: (False, last_restart_info.reduction_ratio_last_trial),
             lambda: restart_criteria_met_fixed_point(
-                self._restart_params, restart_solver_state, last_restart_info
+                cfg.restart_params, restart_solver_state, last_restart_info
             ),
         )
         return cond(
             do_restart,
             lambda: self.perform_restart(
-                restart_solver_state, last_restart_info, kkt_reduction_ratio, problem
+                restart_solver_state,
+                last_restart_info,
+                kkt_reduction_ratio,
+                problem,
+                cfg,
             ),
             lambda: (current_solver_state, last_restart_info),
         )
 
     def initial_iteration_update(
         self,
+        cfg,
         solver_state,
         last_restart_info,
         should_terminate,
@@ -373,6 +392,8 @@ class r2HPDHG(raPDHG):
 
         Parameters
         ----------
+        cfg : SolveConfig
+            The per-solve configuration derived by `resolve_config`.
         solver_state : PdhgSolverState
             The current state of the solver.
         last_restart_info : RestartInfo
@@ -391,11 +412,11 @@ class r2HPDHG(raPDHG):
         """
         # Skip termination check for initial iterations
         restarted_solver_state, new_last_restart_info = self.run_restart_scheme(
-            scaled_problem.scaled_qp, solver_state, last_restart_info
+            scaled_problem.scaled_qp, solver_state, last_restart_info, cfg
         )
 
         new_solver_state = self.take_step(
-            restarted_solver_state, scaled_problem.scaled_qp
+            restarted_solver_state, scaled_problem.scaled_qp, cfg
         )
         new_solver_state.termination_status = TerminationStatus.UNSPECIFIED
         return (
@@ -408,6 +429,7 @@ class r2HPDHG(raPDHG):
 
     def main_iteration_update(
         self,
+        cfg,
         solver_state,
         last_restart_info,
         should_terminate,
@@ -420,21 +442,22 @@ class r2HPDHG(raPDHG):
             check_termination_criteria(
                 scaled_problem,
                 solver_state,
-                self._termination_criteria,
+                cfg.termination_criteria,
                 qp_cache,
                 solver_state.numerical_error,
                 1.0,
                 self.optimality_norm,
-                False,
+                average=False,
+                infeasibility_detection=cfg.infeasibility_detection,
             )
         )
 
         restarted_solver_state, new_last_restart_info = self.run_restart_scheme(
-            scaled_problem.scaled_qp, solver_state, last_restart_info
+            scaled_problem.scaled_qp, solver_state, last_restart_info, cfg
         )
 
         new_solver_state = self.take_multiple_steps(
-            restarted_solver_state, scaled_problem.scaled_qp
+            restarted_solver_state, scaled_problem.scaled_qp, cfg
         )
         new_solver_state.termination_status = termination_status
         return (
@@ -446,7 +469,9 @@ class r2HPDHG(raPDHG):
             convergence_information,
         )
 
-    def primal_feasibility_polishing(self, solver_state, scaled_problem, qp_cache):
+    def primal_feasibility_polishing(
+        self, solver_state, scaled_problem, qp_cache, cfg, initial_primal_weight
+    ):
         """Perform primal feasibility polishing.
 
         Parameters
@@ -457,6 +482,10 @@ class r2HPDHG(raPDHG):
             The original problem and scaled problem data.
         qp_cache : CachedQuadraticProgramInfo
             The cached quadratic programming information.
+        cfg : SolveConfig
+            The per-solve configuration derived by `resolve_config`.
+        initial_primal_weight : float
+            The initial primal weight computed in `initialize_solver_status`.
 
         Returns
         -------
@@ -470,11 +499,13 @@ class r2HPDHG(raPDHG):
             primal_feasibility_solver_state,
             last_restart_info,
         ) = init_primal_feasibility_polishing(
-            scaled_problem, solver_state, self._initial_primal_weight, average=False
+            scaled_problem, solver_state, initial_primal_weight, average=False
         )
         (new_solver_state, last_restart_info, should_terminate, _, _) = while_loop(
             cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.primal_feasibility_polishing_iterate(*state),
+            body_fun=lambda state: self.primal_feasibility_polishing_iterate(
+                cfg, *state
+            ),
             init_val=(
                 primal_feasibility_solver_state,
                 last_restart_info,
@@ -490,6 +521,7 @@ class r2HPDHG(raPDHG):
 
     def primal_feasibility_polishing_iterate(
         self,
+        cfg,
         primal_polishing_solver_state,
         last_restart_info,
         should_terminate,
@@ -505,16 +537,18 @@ class r2HPDHG(raPDHG):
                 primal_polishing_solver_state,
                 zeroed_dual_solver_state,
                 last_restart_info,
+                cfg,
             )
         )
         new_primal_polishing_solver_state = self.take_multiple_steps(
             restarted_primal_polishing_solver_state,
             primal_feasibility_problem.scaled_qp,
+            cfg,
         )
         new_should_terminate = check_primal_feasibility(
             primal_feasibility_problem,
             new_primal_polishing_solver_state,
-            self._polishing_termination_criteria,
+            cfg.polishing_termination_criteria,
             qp_cache,
             1.0,
             self.optimality_norm,
@@ -528,7 +562,9 @@ class r2HPDHG(raPDHG):
             qp_cache,
         )
 
-    def dual_feasibility_polishing(self, solver_state, scaled_problem, qp_cache):
+    def dual_feasibility_polishing(
+        self, solver_state, scaled_problem, qp_cache, cfg, initial_primal_weight
+    ):
         """Perform dual feasibility polishing.
 
         Parameters
@@ -539,6 +575,10 @@ class r2HPDHG(raPDHG):
             The original problem and scaled problem data.
         qp_cache : CachedQuadraticProgramInfo
             The cached quadratic programming information.
+        cfg : SolveConfig
+            The per-solve configuration derived by `resolve_config`.
+        initial_primal_weight : float
+            The initial primal weight computed in `initialize_solver_status`.
 
         Returns
         -------
@@ -549,13 +589,13 @@ class r2HPDHG(raPDHG):
         """
         dual_feasibility_problem, dual_feasibility_solver_state, last_restart_info = (
             init_dual_feasibility_polishing(
-                scaled_problem, solver_state, self._initial_primal_weight, average=False
+                scaled_problem, solver_state, initial_primal_weight, average=False
             )
         )
 
         (new_solver_state, last_restart_info, should_terminate, _, _) = while_loop(
             cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.dual_feasibility_polishing_iterate(*state),
+            body_fun=lambda state: self.dual_feasibility_polishing_iterate(cfg, *state),
             init_val=(
                 dual_feasibility_solver_state,
                 last_restart_info,
@@ -571,6 +611,7 @@ class r2HPDHG(raPDHG):
 
     def dual_feasibility_polishing_iterate(
         self,
+        cfg,
         dual_polishing_solver_state,
         last_restart_info,
         should_terminate,
@@ -586,17 +627,20 @@ class r2HPDHG(raPDHG):
                 dual_polishing_solver_state,
                 zeroed_primal_solver_state,
                 last_restart_info,
+                cfg,
             )
         )
 
         new_dual_polishing_solver_state = self.take_multiple_steps(
-            restarted_dual_polishing_solver_state, dual_feasibility_problem.scaled_qp
+            restarted_dual_polishing_solver_state,
+            dual_feasibility_problem.scaled_qp,
+            cfg,
         )
 
         new_should_terminate = check_dual_feasibility(
             dual_feasibility_problem,
             new_dual_polishing_solver_state,
-            self._polishing_termination_criteria,
+            cfg.polishing_termination_criteria,
             qp_cache,
             1.0,
             self.optimality_norm,
@@ -633,7 +677,7 @@ class r2HPDHG(raPDHG):
         setup_logger(self.verbose, self.debug)
         # validate(original_problem)
         # config_check(params)
-        self.check_config(original_problem.is_lp)
+        cfg = self.resolve_config(original_problem.is_lp)
         qp_cache = cached_quadratic_program_info(original_problem, self.optimality_norm)
 
         precondition_start_time = timeit.default_timer()
@@ -646,8 +690,14 @@ class r2HPDHG(raPDHG):
         precondition_time = timeit.default_timer() - precondition_start_time
         logger.info("Preconditioning Time (seconds): %.2e", precondition_time)
 
-        solver_state, last_restart_info = self.initialize_solver_status(
-            scaled_problem, initial_primal_solution, initial_dual_solution
+        solver_state, last_restart_info, initial_primal_weight = (
+            self.initialize_solver_status(
+                scaled_problem,
+                initial_primal_solution,
+                initial_dual_solution,
+                original_problem.is_lp,
+                cfg,
+            )
         )
 
         # Iteration loop
@@ -656,7 +706,7 @@ class r2HPDHG(raPDHG):
         iteration_start_time = timeit.default_timer()
         (solver_state, last_restart_info, should_terminate, _, _) = while_loop(
             cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.initial_iteration_update(*state),
+            body_fun=lambda state: self.initial_iteration_update(cfg, *state),
             init_val=(solver_state, last_restart_info, False, scaled_problem, qp_cache),
             maxiter=10,
             unroll=self.unroll,
@@ -665,7 +715,7 @@ class r2HPDHG(raPDHG):
 
         (solver_state, last_restart_info, should_terminate, _, _, ci) = while_loop(
             cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.main_iteration_update(*state),
+            body_fun=lambda state: self.main_iteration_update(cfg, *state),
             init_val=(
                 solver_state,
                 last_restart_info,
@@ -684,11 +734,11 @@ class r2HPDHG(raPDHG):
             feasibility_polishing_start_time = timeit.default_timer()
             polished_primal_solution, primal_feasibility = (
                 self.primal_feasibility_polishing(
-                    solver_state, scaled_problem, qp_cache
+                    solver_state, scaled_problem, qp_cache, cfg, initial_primal_weight
                 )
             )
             polished_dual_solution, dual_feasibility = self.dual_feasibility_polishing(
-                solver_state, scaled_problem, qp_cache
+                solver_state, scaled_problem, qp_cache, cfg, initial_primal_weight
             )
             feasibility_polishing_time = (
                 timeit.default_timer() - feasibility_polishing_start_time
@@ -719,9 +769,7 @@ class r2HPDHG(raPDHG):
             accept_polished = (
                 primal_feasibility
                 & dual_feasibility
-                & optimality_criteria_met(
-                    self._termination_criteria.eps_rel, polished_ci
-                )
+                & optimality_criteria_met(cfg.termination_criteria.eps_rel, polished_ci)
             )
             (
                 solver_state.current_primal_solution,

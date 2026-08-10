@@ -92,6 +92,23 @@ class TerminationCriteria(NamedTuple):
     iteration_limit: int = jnp.iinfo(jnp.int32).max
 
 
+class SolveConfig(NamedTuple):
+    """Per-solve configuration derived from solver fields + problem class.
+
+    Immutable: optimize() derives it once per call and threads it through
+    the loops, so a solver instance never changes behavior based on what
+    problems it saw earlier.
+    """
+
+    termination_criteria: TerminationCriteria
+    polishing_termination_criteria: TerminationCriteria
+    # Forward reference: RestartParameters is defined later in this module.
+    restart_params: "RestartParameters"
+    adaptive_step_size: bool
+    infeasibility_detection: bool
+    primal_weight_update_smoothing: float
+
+
 class CachedQuadraticProgramInfo(NamedTuple):
     primal_linear_objective_norm: float
     primal_right_hand_side_norm: float
