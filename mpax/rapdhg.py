@@ -38,6 +38,7 @@ from mpax.utils import (
     TerminationStatus,
     ScaledQpProblem,
     ConvergenceInformation,
+    compute_objective_product,
 )
 from mpax.feasibility_polishing import (
     init_primal_feasibility_polishing,
@@ -474,9 +475,7 @@ class raPDHG(abc.ABC):
             scaled_initial_dual_product = (
                 scaled_qp.constraint_matrix_t @ scaled_initial_dual_solution
             )
-            scaled_primal_obj_product = (
-                scaled_qp.objective_matrix @ scaled_initial_primal_solution
-            )
+            scaled_primal_obj_product = compute_objective_product(scaled_qp, scaled_initial_primal_solution)
         else:
             scaled_initial_primal_solution = jnp.zeros(primal_size)
             scaled_initial_dual_solution = jnp.zeros(dual_size)
@@ -572,7 +571,7 @@ class raPDHG(abc.ABC):
 
         next_primal_solution = solver_state.current_primal_solution + delta_primal
         next_primal_product = solver_state.current_primal_product + delta_primal_product
-        next_primal_obj_product = problem.objective_matrix @ next_primal_solution
+        next_primal_obj_product = compute_objective_product(problem, next_primal_solution)
         next_dual_solution = solver_state.current_dual_solution + delta_dual
         next_dual_product = problem.constraint_matrix_t @ next_dual_solution
 

@@ -688,3 +688,16 @@ def time_code(timing_data_obj, code_block_name, is_main_timer=False):
     yield
     elapsed_time = timeit.default_timer() - start_time
     timing_data_obj.record_time(code_block_name, elapsed_time)
+
+
+def compute_objective_product(problem, primal_solution):
+    """Q @ x, skipping the matmul entirely for LPs.
+
+    `problem.is_lp` is a static pytree field, so this branch is resolved
+    at trace time and costs nothing under jit. For LPs created with
+    use_sparse_matrix=False the objective matrix is a dense all-zero
+    n x n array; multiplying by it every iteration is O(n^2) waste.
+    """
+    if problem.is_lp:
+        return jnp.zeros_like(primal_solution)
+    return problem.objective_matrix @ primal_solution
