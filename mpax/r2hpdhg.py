@@ -24,6 +24,7 @@ from mpax.termination import (
     check_termination_criteria,
     check_primal_feasibility,
     check_dual_feasibility,
+    optimality_criteria_met,
 )
 from mpax.utils import (
     PdhgSolverState,
@@ -692,23 +693,52 @@ class r2HPDHG(raPDHG):
             feasibility_polishing_time = (
                 timeit.default_timer() - feasibility_polishing_start_time
             )
+            polished_primal_product = (
+                scaled_problem.scaled_qp.constraint_matrix @ polished_primal_solution
+            )
+            polished_dual_product = (
+                scaled_problem.scaled_qp.constraint_matrix_t @ polished_dual_solution
+            )
+            polished_primal_obj_product = (
+                scaled_problem.scaled_qp.objective_matrix @ polished_primal_solution
+            )
+            # Convergence information of the polished candidate, computed before
+            # acceptance so that the polished pair is only taken when it actually
+            # satisfies the requested optimality tolerances.
+            polished_ci = compute_convergence_information(
+                scaled_problem.original_qp,
+                qp_cache,
+                polished_primal_solution / scaled_problem.variable_rescaling,
+                polished_dual_solution / scaled_problem.constraint_rescaling,
+                self.eps_abs / self.eps_rel,
+                polished_primal_product * scaled_problem.constraint_rescaling,
+                polished_dual_product * scaled_problem.variable_rescaling,
+                polished_primal_obj_product * scaled_problem.variable_rescaling,
+                self.optimality_norm,
+            )
+            accept_polished = (
+                primal_feasibility
+                & dual_feasibility
+                & optimality_criteria_met(
+                    self._termination_criteria.eps_rel, polished_ci
+                )
+            )
             (
                 solver_state.current_primal_solution,
                 solver_state.current_primal_product,
                 solver_state.current_dual_solution,
                 solver_state.current_dual_product,
                 solver_state.current_primal_obj_product,
+                ci,
             ) = cond(
-                primal_feasibility & dual_feasibility,
+                accept_polished,
                 lambda: (
                     polished_primal_solution,
-                    scaled_problem.scaled_qp.constraint_matrix
-                    @ polished_primal_solution,
+                    polished_primal_product,
                     polished_dual_solution,
-                    scaled_problem.scaled_qp.constraint_matrix_t
-                    @ polished_dual_solution,
-                    scaled_problem.scaled_qp.objective_matrix
-                    @ polished_primal_solution,
+                    polished_dual_product,
+                    polished_primal_obj_product,
+                    polished_ci,
                 ),
                 lambda: (
                     solver_state.current_primal_solution,
@@ -716,22 +746,8 @@ class r2HPDHG(raPDHG):
                     solver_state.current_dual_solution,
                     solver_state.current_dual_product,
                     solver_state.current_primal_obj_product,
+                    ci,
                 ),
-            )
-            ci = compute_convergence_information(
-                scaled_problem.original_qp,
-                qp_cache,
-                solver_state.current_primal_solution
-                / scaled_problem.variable_rescaling,
-                solver_state.current_dual_solution
-                / scaled_problem.constraint_rescaling,
-                self.eps_abs / self.eps_rel,
-                solver_state.current_primal_product
-                * scaled_problem.constraint_rescaling,
-                solver_state.current_dual_product * scaled_problem.variable_rescaling,
-                solver_state.current_primal_obj_product
-                * scaled_problem.variable_rescaling,
-                self.optimality_norm,
             )
         else:
             feasibility_polishing_time = 0

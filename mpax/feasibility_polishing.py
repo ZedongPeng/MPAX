@@ -204,11 +204,17 @@ def init_dual_feasibility_polishing(
 def set_primal_solution_to_zero(solver_state):
     zero_primal_solution = jnp.zeros_like(solver_state.current_primal_solution)
     zero_primal_product = jnp.zeros_like(solver_state.current_primal_product)
+    # x = 0 implies Qx = 0, so the objective products must be zeroed too;
+    # leaving them stale makes the restart/KKT metrics evaluate a point that
+    # mixes x = 0 with the objective product of the previous iterate.
+    zero_primal_obj_product = jnp.zeros_like(solver_state.current_primal_obj_product)
     zeroed_primal_solver_state = solver_state.replace(
         current_primal_solution=zero_primal_solution,
         current_primal_product=zero_primal_product,
+        current_primal_obj_product=zero_primal_obj_product,
         avg_primal_solution=zero_primal_solution,
         avg_primal_product=zero_primal_product,
+        avg_primal_obj_product=zero_primal_obj_product,
         initial_primal_solution=zero_primal_solution,
         initial_primal_product=zero_primal_product,
     )

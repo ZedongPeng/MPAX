@@ -259,8 +259,13 @@ def display_problem_details(qp: QuadraticProgrammingProblem) -> None:
             jnp.mean(jnp.abs(qp.right_hand_side)),
             jnp.sum(finite_label),
             len(bound_gaps),
-            jnp.max(bound_gaps, initial=jnp.nan, where=finite_label),
-            jnp.min(bound_gaps, initial=jnp.nan, where=finite_label),
+            # `initial` is the identity element of the reduction, so it must be
+            # -inf for max / +inf for min: jnp.nan would poison both and print
+            # nan even when finite bounds exist. When no bound gap is finite the
+            # reductions degrade to -inf/+inf (and the mean to nan), which is a
+            # truthful "no finite bounds" readout.
+            jnp.max(bound_gaps, initial=-jnp.inf, where=finite_label),
+            jnp.min(bound_gaps, initial=jnp.inf, where=finite_label),
             jnp.mean(bound_gaps, where=finite_label),
             logger=logger,
             level=logging.INFO,

@@ -36,3 +36,8 @@ def test_problem_details_logging_has_values(capsys):
         assert "largest=" in line and "smallest=" in line
     cm_line = lines[0]  # constraint-matrix line
     assert "smallest=0.000000" not in cm_line
+    # flugpl has finite variable bounds, so the bound-gap reduction must not
+    # report nan (regression guard for initial=jnp.nan poisoning max/min).
+    bound_lines = [l for l in lines if "Gap between upper and lower bounds" in l]
+    assert len(bound_lines) == 1
+    assert "nan" not in bound_lines[0]

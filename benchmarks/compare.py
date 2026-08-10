@@ -29,6 +29,11 @@ def main():
         print(line)
     for key in sorted(new.keys() - old.keys()):
         print(f"{'/'.join(key):40s} NEW (no baseline)")
+    for key in sorted(old.keys() - new.keys()):
+        # A dropped instance is a regression signal (crash, timeout, or a run
+        # that silently skipped it), so it must fail the comparison.
+        print(f"{'/'.join(key):40s} REMOVED (in baseline, missing from new)   <-- FLAG")
+        flagged = True
     sys.exit(1 if flagged else 0)
 
 
