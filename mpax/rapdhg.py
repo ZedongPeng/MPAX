@@ -2,6 +2,7 @@ import abc
 import logging
 import timeit
 from dataclasses import dataclass
+from typing import Tuple
 
 import jax
 import jax.numpy as jnp
@@ -425,7 +426,7 @@ class raPDHG(abc.ABC):
         initial_dual_solution: jnp.array,
         is_lp: bool,
         cfg: SolveConfig,
-    ) -> PdhgSolverState:
+    ) -> Tuple[PdhgSolverState, RestartInfo, float]:
         """Initialize the solver status for PDHG.
 
         Parameters
@@ -443,8 +444,11 @@ class raPDHG(abc.ABC):
 
         Returns
         -------
-        PdhgSolverState
-            The initial solver status.
+        Tuple[PdhgSolverState, RestartInfo, float]
+            A tuple containing:
+            - PdhgSolverState: The initial solver state.
+            - RestartInfo: The initial restart bookkeeping information.
+            - float: The initial primal weight.
         """
         scaled_qp = scaled_problem.scaled_qp
         primal_size = len(scaled_qp.variable_lower_bound)

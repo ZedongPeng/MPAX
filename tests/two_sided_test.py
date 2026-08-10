@@ -4,7 +4,12 @@ from jax import config
 
 config.update("jax_enable_x64", True)
 
-from mpax.mp_io import create_lp, create_lp_standard_form
+from mpax.mp_io import (
+    create_lp,
+    create_lp_standard_form,
+    create_qp,
+    create_qp_standard_form,
+)
 from mpax.rapdhg import raPDHG
 from mpax.utils import TerminationStatus
 
@@ -99,3 +104,24 @@ def test_free_row_gets_zero_dual():
     assert result.termination_status == TerminationStatus.OPTIMAL
     assert pytest.approx(float(result.primal_objective), abs=1e-4) == 1.0
     assert abs(float(result.dual_solution[1])) < 1e-6
+
+
+def test_qp_standard_form_wrapper_matches_two_sided():
+    Q = jnp.eye(3)
+    with pytest.warns(DeprecationWarning, match="create_qp_standard_form"):
+        qp_old = create_qp_standard_form(
+            Q, _C, _A_EQ, _B, _G, _H, _L, _U, use_sparse_matrix=False
+        )
+    A = jnp.concatenate([_A_EQ, _G], axis=0)
+    lc = jnp.array([2.0, 0.0, 1.0])
+    uc = jnp.array([2.0, jnp.inf, jnp.inf])
+    qp_new = create_qp(Q, _C, A, lc, uc, _L, _U, use_sparse_matrix=False)
+
+    assert jnp.array_equal(qp_old.constraint_lower_bound, qp_new.constraint_lower_bound)
+    assert jnp.array_equal(qp_old.constraint_upper_bound, qp_new.constraint_upper_bound)
+    assert jnp.array_equal(qp_old.constraint_matrix, qp_new.constraint_matrix)
+    assert jnp.array_equal(qp_old.objective_matrix, qp_new.objective_matrix)
+    assert qp_old.is_lp is False and qp_new.is_lp is False
+    # The LP constructor's None-objective invariant, pinned directly.
+    lp = create_lp(_C, A, lc, uc, _L, _U, use_sparse_matrix=False)
+    assert lp.objective_matrix is None and lp.is_lp is True
