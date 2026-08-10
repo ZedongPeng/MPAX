@@ -14,6 +14,8 @@ def zeros_like_matrix(matrix):
     problem keeps the same pytree structure as the original one, which jit
     requires.
     """
+    if matrix is None:
+        return None
     if isinstance(matrix, BCOO):
         return BCOO(
             (jnp.zeros_like(matrix.data), matrix.indices),
@@ -132,7 +134,16 @@ def init_dual_feasibility_polishing(
                 0.0,
                 scaled_problem.original_qp.variable_upper_bound,
             ),
-            right_hand_side=jnp.zeros_like(scaled_problem.original_qp.right_hand_side),
+            constraint_lower_bound=jnp.where(
+                jnp.isfinite(scaled_problem.original_qp.constraint_lower_bound),
+                0.0,
+                scaled_problem.original_qp.constraint_lower_bound,
+            ),
+            constraint_upper_bound=jnp.where(
+                jnp.isfinite(scaled_problem.original_qp.constraint_upper_bound),
+                0.0,
+                scaled_problem.original_qp.constraint_upper_bound,
+            ),
         ),
         scaled_qp=dataclass_replace(
             scaled_problem.scaled_qp,
@@ -146,7 +157,16 @@ def init_dual_feasibility_polishing(
                 0.0,
                 scaled_problem.scaled_qp.variable_upper_bound,
             ),
-            right_hand_side=jnp.zeros_like(scaled_problem.scaled_qp.right_hand_side),
+            constraint_lower_bound=jnp.where(
+                jnp.isfinite(scaled_problem.scaled_qp.constraint_lower_bound),
+                0.0,
+                scaled_problem.scaled_qp.constraint_lower_bound,
+            ),
+            constraint_upper_bound=jnp.where(
+                jnp.isfinite(scaled_problem.scaled_qp.constraint_upper_bound),
+                0.0,
+                scaled_problem.scaled_qp.constraint_upper_bound,
+            ),
         ),
         constraint_rescaling=scaled_problem.constraint_rescaling,
         variable_rescaling=scaled_problem.variable_rescaling,

@@ -36,6 +36,7 @@ from mpax.utils import (
     SolveConfig,
     TerminationStatus,
     ConvergenceInformation,
+    compute_objective_product,
 )
 from mpax.feasibility_polishing import (
     set_dual_solution_to_zero,
@@ -749,8 +750,8 @@ class r2HPDHG(raPDHG):
             polished_dual_product = (
                 scaled_problem.scaled_qp.constraint_matrix_t @ polished_dual_solution
             )
-            polished_primal_obj_product = (
-                scaled_problem.scaled_qp.objective_matrix @ polished_primal_solution
+            polished_primal_obj_product = compute_objective_product(
+                scaled_problem.scaled_qp, polished_primal_solution
             )
             # Convergence information of the polished candidate, computed before
             # acceptance so that the polished pair is only taken when it actually

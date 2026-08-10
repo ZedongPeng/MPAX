@@ -13,23 +13,21 @@ def _tiny_qp():
     # min 1/2 x'Ix - x1 - x2  s.t. x1 + x2 >= 1, 0 <= x <= 1
     Q = jnp.eye(2)
     c = jnp.array([-1.0, -1.0])
-    A = jnp.zeros((0, 2))
-    b = jnp.zeros(0)
     G = jnp.ones((1, 2))
-    h = jnp.ones(1)
-    return create_qp(
-        Q, c, A, b, G, h, jnp.zeros(2), jnp.ones(2), use_sparse_matrix=False
-    )
+    lc = jnp.ones(1)
+    uc = jnp.array([jnp.inf])
+    return create_qp(Q, c, G, lc, uc, jnp.zeros(2), jnp.ones(2),
+                     use_sparse_matrix=False)
 
 
 def _tiny_lp():
     # min x1 + 2 x2  s.t. x1 + x2 >= 1, 0 <= x <= 1  (optimum 1.0 at (1, 0))
     c = jnp.array([1.0, 2.0])
-    A = jnp.zeros((0, 2))
-    b = jnp.zeros(0)
     G = jnp.ones((1, 2))
-    h = jnp.ones(1)
-    return create_lp(c, A, b, G, h, jnp.zeros(2), jnp.ones(2), use_sparse_matrix=False)
+    lc = jnp.ones(1)
+    uc = jnp.array([jnp.inf])
+    return create_lp(c, G, lc, uc, jnp.zeros(2), jnp.ones(2),
+                     use_sparse_matrix=False)
 
 
 def test_qp_solve_does_not_mutate_config():

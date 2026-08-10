@@ -43,15 +43,25 @@ def validate(p: QuadraticProgrammingProblem) -> bool:
         logger.error("%d != %d", len(p.variable_lower_bound), len(p.objective_vector))
         error_found = True
 
-    if p.constraint_matrix.shape[0] != len(p.right_hand_side):
-        logger.error("%d != %d", p.constraint_matrix.shape[0], len(p.right_hand_side))
+    if p.constraint_matrix.shape[0] != len(
+        p.constraint_lower_bound
+    ) or p.constraint_matrix.shape[0] != len(p.constraint_upper_bound):
+        logger.error(
+            "%d != %d != %d",
+            p.constraint_matrix.shape[0],
+            len(p.constraint_lower_bound),
+            len(p.constraint_upper_bound),
+        )
         error_found = True
 
     if p.constraint_matrix.shape[1] != len(p.objective_vector):
         logger.error("%d != %d", p.constraint_matrix.shape[1], len(p.objective_vector))
         error_found = True
 
-    if p.objective_matrix.shape != (len(p.objective_vector), len(p.objective_vector)):
+    if p.objective_matrix is not None and p.objective_matrix.shape != (
+        len(p.objective_vector),
+        len(p.objective_vector),
+    ):
         logger.error(
             "%s is not square with length %d",
             p.objective_matrix.shape,
@@ -79,10 +89,22 @@ def validate(p: QuadraticProgrammingProblem) -> bool:
         logger.error("NaN found in variable bounds of QuadraticProgrammingProblem.")
         error_found = True
 
-    if jnp.any(jnp.isinf(p.right_hand_side)) or jnp.any(jnp.isnan(p.right_hand_side)):
-        logger.error(
-            "NaN or Inf found in right hand side of QuadraticProgrammingProblem."
-        )
+    if jnp.any(jnp.isnan(p.constraint_lower_bound)) or jnp.any(
+        jnp.isnan(p.constraint_upper_bound)
+    ):
+        logger.error("NaN found in constraint bounds of QuadraticProgrammingProblem.")
+        error_found = True
+
+    if jnp.any(p.constraint_lower_bound == jnp.inf):
+        logger.error("constraint_lower_bound must not contain +inf entries.")
+        error_found = True
+
+    if jnp.any(p.constraint_upper_bound == -jnp.inf):
+        logger.error("constraint_upper_bound must not contain -inf entries.")
+        error_found = True
+
+    if jnp.any(p.constraint_lower_bound > p.constraint_upper_bound):
+        logger.error("constraint_lower_bound must be <= constraint_upper_bound.")
         error_found = True
 
     if jnp.any(jnp.isinf(p.objective_vector)) or jnp.any(jnp.isnan(p.objective_vector)):
@@ -99,8 +121,9 @@ def validate(p: QuadraticProgrammingProblem) -> bool:
         )
         error_found = True
 
-    if jnp.any(jnp.isinf(p.objective_matrix.data)) or jnp.any(
-        jnp.isnan(p.objective_matrix.data)
+    if p.objective_matrix is not None and (
+        jnp.any(jnp.isinf(p.objective_matrix.data))
+        or jnp.any(jnp.isnan(p.objective_matrix.data))
     ):
         logger.error(
             "NaN or Inf found in objective matrix of QuadraticProgrammingProblem."
@@ -144,10 +167,13 @@ def remove_empty_rows(problem: QuadraticProgrammingProblem) -> List[int]:
 
     empty_rows = jnp.where(~seen_row)[0]
 
+    # An empty row (all-zero coefficients) is feasible only if 0 lies within
+    # [constraint_lower_bound[row], constraint_upper_bound[row]].
     for row in empty_rows:
-        if row > problem.num_equalities and problem.right_hand_side[row] > 0.0:
-            raise ValueError("The problem is infeasible.")
-        elif row <= problem.num_equalities and problem.right_hand_side[row] != 0.0:
+        if (
+            problem.constraint_lower_bound[row] > 0.0
+            or problem.constraint_upper_bound[row] < 0.0
+        ):
             raise ValueError("The problem is infeasible.")
 
     if len(empty_rows) > 0:
@@ -167,9 +193,8 @@ def remove_empty_rows(problem: QuadraticProgrammingProblem) -> List[int]:
             problem.constraint_matrix = new_coo_matrix
         elif isinstance(problem.constraint_matrix, jnp.ndarray):
             problem.constraint_matrix = problem.constraint_matrix[seen_row, :]
-        problem.right_hand_side = problem.right_hand_side[seen_row]
-        num_empty_equalities = jnp.sum(empty_rows <= problem.num_equalities)
-        problem.num_equalities -= num_empty_equalities
+        problem.constraint_lower_bound = problem.constraint_lower_bound[seen_row]
+        problem.constraint_upper_bound = problem.constraint_upper_bound[seen_row]
 
     return empty_rows.tolist()
 
@@ -298,13 +323,19 @@ def transform_bounds_into_linear_constraints(qp: QuadraticProgrammingProblem) ->
         [qp.constraint_matrix, identity_block], dimension=0
     )
 
-    # Update the right-hand side vector
-    qp.right_hand_side = jnp.concatenate(
+    # Update the constraint bounds: new rows are `>=` rows (uc = +inf), with
+    # lc equal to the old right-hand side (lb_i for lower-bound rows, -ub_i
+    # for upper-bound rows, matching the -1 coefficient in identity_block).
+    num_new_rows = len(finite_lower_bound_indices) + len(finite_upper_bound_indices)
+    qp.constraint_lower_bound = jnp.concatenate(
         [
-            qp.right_hand_side,
+            qp.constraint_lower_bound,
             qp.variable_lower_bound[finite_lower_bound_indices],
             -qp.variable_upper_bound[finite_upper_bound_indices],
         ]
+    )
+    qp.constraint_upper_bound = jnp.concatenate(
+        [qp.constraint_upper_bound, jnp.full(num_new_rows, jnp.inf)]
     )
 
     # Update variable bounds to be infinite
@@ -407,8 +438,10 @@ def scale_problem(
     # Scale the objective vector
     problem.objective_vector /= variable_rescaling
 
-    # Scale the objective matrix using BCSR format directly
-    if isinstance(problem.objective_matrix, jnp.ndarray):
+    # Scale the objective matrix (None for LPs — nothing to scale)
+    if problem.objective_matrix is None:
+        pass
+    elif isinstance(problem.objective_matrix, jnp.ndarray):
         # Scale the matrix along the rows
         # variable_rescaling[:, None] reshapes variable_rescaling from (n,) to (n, 1),
         # enabling broadcasting along the rows. Each element in row i is divided by variable_rescaling[i].
@@ -431,8 +464,9 @@ def scale_problem(
     problem.variable_upper_bound *= variable_rescaling
     problem.variable_lower_bound *= variable_rescaling
 
-    # Scale the right-hand side vector
-    problem.right_hand_side /= constraint_rescaling
+    # Scale the constraint bounds (inf entries stay inf: rescaling > 0)
+    problem.constraint_lower_bound /= constraint_rescaling
+    problem.constraint_upper_bound /= constraint_rescaling
 
     # Scale the constraint matrix
     if isinstance(problem.constraint_matrix, jnp.ndarray):
@@ -488,9 +522,14 @@ def l2_norm_rescaling(
     """
     # Calculate L2 norms of rows and columns
     norm_of_rows = get_row_l2_norms(problem.constraint_matrix)
+    objective_col_l2 = (
+        jnp.zeros(problem.constraint_matrix.shape[1])
+        if problem.objective_matrix is None
+        else get_col_l2_norms(problem.objective_matrix)
+    )
     norm_of_columns = jnp.sqrt(
         jnp.square(get_col_l2_norms(problem.constraint_matrix))
-        + jnp.square(get_col_l2_norms(problem.objective_matrix))
+        + jnp.square(objective_col_l2)
     )
     # Avoid division by zero by setting norms to 1 where they are 0
     norm_of_rows = jnp.where(norm_of_rows == 0, 1.0, norm_of_rows)
@@ -644,15 +683,24 @@ def ruiz_rescaling(
         # Determine variable rescaling
         if p == float("inf"):
             constraint_col_max = get_col_l_inf_norms(constraint_matrix)
-            objective_col_max = get_col_l_inf_norms(objective_matrix)
+            objective_col_max = (
+                jnp.zeros(num_variables)
+                if problem.is_lp
+                else get_col_l_inf_norms(objective_matrix)
+            )
             variable_rescaling = jnp.sqrt(
                 jnp.maximum(constraint_col_max, objective_col_max)
             )
         elif p == 2:
+            objective_col_l2 = (
+                jnp.zeros(num_variables)
+                if problem.is_lp
+                else get_col_l2_norms(objective_matrix)
+            )
             variable_rescaling = jnp.sqrt(
                 jnp.sqrt(
                     jnp.square(get_col_l2_norms(constraint_matrix))
-                    + jnp.square(get_col_l2_norms(objective_matrix))
+                    + jnp.square(objective_col_l2)
                 )
             )
         else:
@@ -675,7 +723,7 @@ def ruiz_rescaling(
 
                 # Determine the target row norm
                 target_row_norm = jnp.sqrt(num_variables / num_constraints)
-                if jnp.all(problem.objective_matrix.data == 0):
+                if problem.is_lp:
                     # LP case
                     target_row_norm = jnp.sqrt(num_variables / num_constraints)
                 else:
@@ -804,9 +852,13 @@ def pock_chambolle_rescaling(
     constraint_matrix = qp.constraint_matrix
     objective_matrix = qp.objective_matrix
     if isinstance(qp.constraint_matrix, jnp.ndarray):
+        objective_term = (
+            0.0
+            if qp.objective_matrix is None
+            else jnp.sum(jnp.abs(objective_matrix) ** (2 - alpha), axis=0)
+        )
         variable_rescaling = jnp.sqrt(
-            jnp.sum(jnp.abs(constraint_matrix) ** (2 - alpha), axis=0)
-            + jnp.sum(jnp.abs(objective_matrix) ** (2 - alpha), axis=0)
+            jnp.sum(jnp.abs(constraint_matrix) ** (2 - alpha), axis=0) + objective_term
         )
         constraint_rescaling = jnp.sqrt(
             jnp.sum(jnp.abs(constraint_matrix) ** (2 - alpha), axis=1)
@@ -814,17 +866,22 @@ def pock_chambolle_rescaling(
     elif isinstance(qp.constraint_matrix, BCOO):
         # TODO: improve the code here, instead of using jnp.bincount.
         # Use BCOO.sum or use the sparsify() transform.
+        objective_term = (
+            0.0
+            if qp.objective_matrix is None
+            else jnp.bincount(
+                objective_matrix.indices[:, 1],
+                weights=jnp.abs(objective_matrix.data) ** (2 - alpha),
+                length=objective_matrix.shape[1],
+            )
+        )
         variable_rescaling = jnp.sqrt(
             jnp.bincount(
                 constraint_matrix.indices[:, 1],
                 weights=jnp.abs(constraint_matrix.data) ** (2 - alpha),
                 length=constraint_matrix.shape[1],
             )
-            + jnp.bincount(
-                objective_matrix.indices[:, 1],
-                weights=jnp.abs(objective_matrix.data) ** (2 - alpha),
-                length=objective_matrix.shape[1],
-            )
+            + objective_term
         )
         constraint_rescaling = jnp.sqrt(
             jnp.bincount(

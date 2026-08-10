@@ -16,39 +16,12 @@ from mpax.utils import (
 )
 
 
-def compute_primal_residual_constraint(
-    activities: jnp.ndarray, right_hand_side: jnp.ndarray, equalities_mask: jnp.ndarray
-) -> jnp.ndarray:
-    """
-    Kernel to compute the violation of primal constraints.
-
-    Parameters
-    ----------
-    activities : jnp.ndarray
-        Vector of activities.
-    right_hand_side : jnp.ndarray
-        Right-hand side vector.
-    equalities_mask : jnp.ndarray
-        Boolean array indicating equality constraints.
-
-    Returns
-    -------
-    jnp.ndarray
-        Constraint violation vector.
-    """
-    constraint_violation = jax.lax.select(
-        equalities_mask,
-        right_hand_side - activities,
-        jnp.maximum(right_hand_side - activities, 0.0),
-    )
-    return constraint_violation
-
-
 def compute_dual_objective(
     variable_lower_bound: jnp.ndarray,
     variable_upper_bound: jnp.ndarray,
     reduced_costs: jnp.ndarray,
-    right_hand_side: jnp.ndarray,
+    constraint_lower_bound: jnp.ndarray,
+    constraint_upper_bound: jnp.ndarray,
     primal_solution: jnp.ndarray,
     dual_solution: jnp.ndarray,
     primal_obj_product: jnp.ndarray,
@@ -64,8 +37,10 @@ def compute_dual_objective(
         Upper bound of variables.
     reduced_costs : jnp.ndarray
         Reduced costs.
-    right_hand_side : jnp.ndarray
-        Right hand side of the constraints.
+    constraint_lower_bound : jnp.ndarray
+        Lower bounds of the constraints.
+    constraint_upper_bound : jnp.ndarray
+        Upper bounds of the constraints.
     primal_solution : jnp.ndarray
         Primal solution.
     dual_solution : jnp.ndarray
@@ -91,8 +66,17 @@ def compute_dual_objective(
             ),
         )
     )
+    lower_finite = jnp.where(
+        jnp.isfinite(constraint_lower_bound), constraint_lower_bound, 0.0
+    )
+    upper_finite = jnp.where(
+        jnp.isfinite(constraint_upper_bound), constraint_upper_bound, 0.0
+    )
     base_dual_objective = (
-        jnp.dot(right_hand_side, dual_solution)
+        jnp.sum(
+            jnp.maximum(dual_solution, 0.0) * lower_finite
+            + jnp.minimum(dual_solution, 0.0) * upper_finite
+        )
         + objective_constant
         - 0.5 * jnp.dot(primal_solution, primal_obj_product)
     )
@@ -157,10 +141,8 @@ def compute_kkt_components(
     upper_variable_violation = jnp.maximum(
         primal_iterate - problem.variable_upper_bound, 0.0
     )
-    constraint_violation = jax.lax.select(
-        problem.equalities_mask,
-        problem.right_hand_side - primal_product,
-        jnp.maximum(problem.right_hand_side - primal_product, 0.0),
+    constraint_violation = primal_product - jnp.clip(
+        primal_product, problem.constraint_lower_bound, problem.constraint_upper_bound
     )
     primal_residual_norm = jnp.linalg.norm(
         jnp.concatenate(
@@ -184,14 +166,21 @@ def compute_kkt_components(
         problem.variable_lower_bound,
         problem.variable_upper_bound,
         reduced_costs,
-        problem.right_hand_side,
+        problem.constraint_lower_bound,
+        problem.constraint_upper_bound,
         primal_iterate,
         dual_iterate,
         primal_obj_product,
         problem.objective_constant,
     )
     dual_residual = jnp.where(
-        problem.inequalities_mask, jnp.maximum(-dual_iterate, 0.0), 0.0
+        jnp.isfinite(problem.constraint_lower_bound),
+        0.0,
+        jnp.maximum(dual_iterate, 0.0),
+    ) + jnp.where(
+        jnp.isfinite(problem.constraint_upper_bound),
+        0.0,
+        jnp.maximum(-dual_iterate, 0.0),
     )
     dual_residual_norm = jnp.linalg.norm(
         jnp.concatenate([dual_residual, reduced_costs_violation]), ord=norm_ord
@@ -271,7 +260,7 @@ def compute_convergence_information(
     relative_primal_residual_norm = primal_residual_norm / (
         eps_ratio
         + jnp.maximum(
-            qp_cache.primal_right_hand_side_norm,
+            qp_cache.constraint_bound_norm,
             jnp.linalg.norm(primal_product, ord=norm_ord),
         )
     )
@@ -360,14 +349,14 @@ def compute_infeasibility_information(
         0.0,
     )
 
-    constraint_violation = jax.lax.select(
-        problem.equalities_mask,
-        jnp.zeros_like(problem.right_hand_side) - scaled_primal_ray_estimate_product,
-        jnp.maximum(
-            jnp.zeros_like(problem.right_hand_side)
-            - scaled_primal_ray_estimate_product,
-            0.0,
-        ),
+    constraint_violation = jnp.where(
+        jnp.isfinite(problem.constraint_upper_bound),
+        jnp.maximum(scaled_primal_ray_estimate_product, 0.0),
+        0.0,
+    ) + jnp.where(
+        jnp.isfinite(problem.constraint_lower_bound),
+        jnp.maximum(-scaled_primal_ray_estimate_product, 0.0),
+        0.0,
     )
 
     max_primal_ray_infeasibility = jnp.linalg.norm(
@@ -388,14 +377,21 @@ def compute_infeasibility_information(
         problem.variable_lower_bound,
         problem.variable_upper_bound,
         reduced_costs,
-        problem.right_hand_side,
+        problem.constraint_lower_bound,
+        problem.constraint_upper_bound,
         primal_ray_estimate,
         dual_ray_estimate,
         primal_ray_estimate_obj_product,
         problem.objective_constant,
     )
     dual_residual = jnp.where(
-        problem.inequalities_mask, jnp.maximum(-dual_ray_estimate, 0.0), 0.0
+        jnp.isfinite(problem.constraint_lower_bound),
+        0.0,
+        jnp.maximum(dual_ray_estimate, 0.0),
+    ) + jnp.where(
+        jnp.isfinite(problem.constraint_upper_bound),
+        0.0,
+        jnp.maximum(-dual_ray_estimate, 0.0),
     )
     l_inf_dual_residual = jnp.linalg.norm(
         jnp.concatenate([dual_residual, reduced_costs_violation]), ord=jnp.inf

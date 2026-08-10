@@ -5,7 +5,12 @@ from jax import debug, lax
 from jax import numpy as jnp
 from jax.experimental.sparse import BCOO, BCSR
 
-from mpax.utils import QuadraticProgrammingProblem, TerminationStatus, TimingData
+from mpax.utils import (
+    QuadraticProgrammingProblem,
+    TerminationStatus,
+    TimingData,
+    combined_constraint_bounds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +198,9 @@ def display_problem_details(qp: QuadraticProgrammingProblem) -> None:
         else:
             constraint_matrix_nnz_count = jnp.count_nonzero(qp.constraint_matrix)
             constraint_matrix_data = qp.constraint_matrix
-        if isinstance(qp.objective_matrix, (BCOO, BCSR)):
+        if qp.objective_matrix is None:
+            objective_matrix_data = jnp.zeros(0)
+        elif isinstance(qp.objective_matrix, (BCOO, BCSR)):
             objective_matrix_data = qp.objective_matrix.data
         else:
             objective_matrix_data = qp.objective_matrix
@@ -201,6 +208,11 @@ def display_problem_details(qp: QuadraticProgrammingProblem) -> None:
         row_norms = get_row_l_inf_norms(qp.constraint_matrix)
         bound_gaps = qp.variable_upper_bound - qp.variable_lower_bound
         finite_label = jnp.isfinite(bound_gaps)
+        num_equalities = jnp.sum(
+            (qp.constraint_lower_bound == qp.constraint_upper_bound)
+            & jnp.isfinite(qp.constraint_lower_bound)
+        )
+        finite_bound_values = combined_constraint_bounds(qp)
 
         objective_abs = jnp.abs(objective_matrix_data)
         constraint_abs = jnp.abs(constraint_matrix_data)
@@ -235,13 +247,13 @@ def display_problem_details(qp: QuadraticProgrammingProblem) -> None:
             + objective_matrix_line
             + "Absolute value of objective vector elements: "
             "largest={:.6f}, smallest={:.6f}, avg={:.6f}\n"
-            "Absolute value of rhs vector elements: "
+            "Absolute value of finite constraint bound elements: "
             "largest={:.6f}, smallest={:.6f}, avg={:.6f}\n"
             "Gap between upper and lower bounds: # finite={:d} of {:d}, "
             "largest={:f}, smallest={:f}, avg={:f}",
             qp.num_variables,
             qp.num_constraints,
-            qp.num_equalities,
+            num_equalities,
             constraint_matrix_nnz_count,
             jnp.max(constraint_abs, initial=0.0),
             jnp.min(constraint_abs, initial=jnp.inf),
@@ -254,9 +266,9 @@ def display_problem_details(qp: QuadraticProgrammingProblem) -> None:
             jnp.max(jnp.abs(qp.objective_vector)),
             jnp.min(jnp.abs(qp.objective_vector)),
             jnp.mean(jnp.abs(qp.objective_vector)),
-            jnp.max(jnp.abs(qp.right_hand_side)),
-            jnp.min(jnp.abs(qp.right_hand_side)),
-            jnp.mean(jnp.abs(qp.right_hand_side)),
+            jnp.max(jnp.abs(finite_bound_values)),
+            jnp.min(jnp.abs(finite_bound_values)),
+            jnp.mean(jnp.abs(finite_bound_values)),
             jnp.sum(finite_label),
             len(bound_gaps),
             # `initial` is the identity element of the reduction, so it must be

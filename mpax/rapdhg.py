@@ -174,18 +174,19 @@ def compute_next_solution(
     delta_primal = next_primal_solution - solver_state.current_primal_solution
     delta_primal_product = problem.constraint_matrix @ delta_primal
 
-    # Compute the next dual solution.
-    next_dual_solution = solver_state.current_dual_solution + (
-        solver_state.primal_weight * step_size
-    ) * (
-        problem.right_hand_side
-        - (1 + extrapolation_coefficient) * delta_primal_product
-        - solver_state.current_primal_product
+    # Compute the next dual solution via a single Moreau projection that
+    # covers all four row classes (eq / >= / <= / free); see the design
+    # spec section 4. For a `>=` row it reduces exactly to the old
+    # y + tau*(lc - Ax~) followed by clamping at zero.
+    dual_step = solver_state.primal_weight * step_size
+    next_dual_candidate = solver_state.current_dual_solution - dual_step * (
+        (1 + extrapolation_coefficient) * delta_primal_product
+        + solver_state.current_primal_product
     )
-    next_dual_solution = jnp.where(
-        problem.inequalities_mask,
-        jnp.maximum(next_dual_solution, 0.0),
-        next_dual_solution,
+    next_dual_solution = next_dual_candidate - jnp.clip(
+        next_dual_candidate,
+        -dual_step * problem.constraint_upper_bound,
+        -dual_step * problem.constraint_lower_bound,
     )
     delta_dual_solution = next_dual_solution - solver_state.current_dual_solution
     return delta_primal, delta_primal_product, delta_dual_solution
@@ -447,7 +448,7 @@ class raPDHG(abc.ABC):
         """
         scaled_qp = scaled_problem.scaled_qp
         primal_size = len(scaled_qp.variable_lower_bound)
-        dual_size = len(scaled_qp.right_hand_side)
+        dual_size = scaled_qp.constraint_matrix.shape[0]
 
         # Primal weight initialization
         if self.scale_invariant_initial_primal_weight:
@@ -478,11 +479,12 @@ class raPDHG(abc.ABC):
             self._norm_A = estimate_maximum_singular_value(scaled_qp.constraint_matrix)[
                 0
             ]
-            self._norm_Q = jax.lax.cond(
-                is_lp,
-                lambda: 0.0,
-                lambda: estimate_maximum_singular_value(scaled_qp.objective_matrix)[0],
-            )
+            if is_lp:
+                self._norm_Q = 0.0
+            else:
+                self._norm_Q = estimate_maximum_singular_value(
+                    scaled_qp.objective_matrix
+                )[0]
             step_size = 1.0  # Placeholder for step size.
 
         if self.warm_start:
@@ -1088,8 +1090,8 @@ class raPDHG(abc.ABC):
             polished_dual_product = (
                 scaled_problem.scaled_qp.constraint_matrix_t @ polished_dual_solution
             )
-            polished_primal_obj_product = (
-                scaled_problem.scaled_qp.objective_matrix @ polished_primal_solution
+            polished_primal_obj_product = compute_objective_product(
+                scaled_problem.scaled_qp, polished_primal_solution
             )
             # Convergence information of the polished candidate, computed before
             # acceptance so that the polished pair is only taken when it actually

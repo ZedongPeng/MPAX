@@ -15,6 +15,7 @@ from mpax.utils import (
     SaddlePointOutput,
     ScaledQpProblem,
     TerminationStatus,
+    combined_constraint_bounds,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,7 @@ def compute_weight_kkt_residual(
         )
     )
     denominator = 1 + jnp.maximum(
-        jnp.linalg.norm(problem.right_hand_side, ord=norm_ord),
+        jnp.linalg.norm(combined_constraint_bounds(problem), ord=norm_ord),
         jnp.linalg.norm(primal_product, ord=norm_ord),
     )
     relative_primal_residual_norm = primal_residual_norm / denominator
@@ -749,7 +750,7 @@ def select_initial_primal_weight(
     float
         The initial primal weight.
     """
-    rhs_vec_norm = weighted_norm(problem.right_hand_side, dual_norm_params)
+    rhs_vec_norm = weighted_norm(combined_constraint_bounds(problem), dual_norm_params)
     obj_vec_norm = weighted_norm(problem.objective_vector, primal_norm_params)
     primal_weight = jax.lax.cond(
         (obj_vec_norm > 0.0) & (rhs_vec_norm > 0.0),

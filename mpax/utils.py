@@ -50,7 +50,7 @@ class TerminationCriteria(NamedTuple):
     Let p correspond to the norm we are using as specified by optimality_norm.
     If the algorithm terminates with termination_status = OPTIMAL then the following hold:
     (1) | primal_objective - dual_objective | <= eps_abs + eps_rel * ( | primal_objective | + | dual_objective | )
-    (2) norm(primal_residual, p) <= eps_abs + eps_rel * norm(right_hand_side, p)
+    (2) norm(primal_residual, p) <= eps_abs + eps_rel * norm(combined_constraint_bounds(problem), p)
     (3) norm(dual_residual, p) <= eps_abs + eps_rel * norm(objective_vector, p)
 
     It is possible to prove that a solution satisfying the above conditions also satisfies SCS's optimality conditions (see link above) with ϵ_pri = ϵ_dual = ϵ_gap = eps_abs = eps_rel. (ϵ_pri, ϵ_dual, and ϵ_gap are SCS's parameters).
@@ -111,42 +111,7 @@ class SolveConfig(NamedTuple):
 
 class CachedQuadraticProgramInfo(NamedTuple):
     primal_linear_objective_norm: float
-    primal_right_hand_side_norm: float
-
-
-@dataclass
-class TwoSidedQpProblem:
-    """
-    A data class representing a quadratic programming problem with two-sided constraints.
-
-    Attributes
-    ----------
-    variable_lower_bound : List[float]
-        Lower bounds on the variables.
-    variable_upper_bound : List[float]
-        Upper bounds on the variables.
-    constraint_lower_bound : List[float]
-        Lower bounds on the constraints.
-    constraint_upper_bound : List[float]
-        Upper bounds on the constraints.
-    constraint_matrix : sparse.BCSR
-        The constraint matrix in BCSR format.
-    objective_constant : float
-        The constant term in the objective.
-    objective_vector : List[float]
-        The objective vector.
-    objective_matrix : sparse.BCSR
-        The objective matrix in BCSR format.
-    """
-
-    variable_lower_bound: List[float]
-    variable_upper_bound: List[float]
-    constraint_lower_bound: List[float]
-    constraint_upper_bound: List[float]
-    constraint_matrix: Union[BCSR, BCOO, jnp.ndarray]
-    objective_constant: float
-    objective_vector: List[float]
-    objective_matrix: Union[BCSR, BCOO, jnp.ndarray]
+    constraint_bound_norm: float
 
 
 @functools.partial(
@@ -163,10 +128,8 @@ class TwoSidedQpProblem:
         "objective_constant",
         "constraint_matrix",
         "constraint_matrix_t",
-        "right_hand_side",
-        "num_equalities",
-        "equalities_mask",
-        "inequalities_mask",
+        "constraint_lower_bound",
+        "constraint_upper_bound",
     ],
     meta_fields=["is_lp"],
 )
@@ -178,9 +141,15 @@ class QuadraticProgrammingProblem:
 
     minimize 1/2 x' * objective_matrix * x + objective_vector' * x + objective_constant
 
-    s.t. constraint_matrix[1:num_equalities, :] * x = right_hand_side[1:num_equalities]
-         constraint_matrix[(num_equalities + 1):end, :] * x >= right_hand_side[(num_equalities + 1):end]
+    s.t. constraint_lower_bound <= constraint_matrix * x <= constraint_upper_bound
          variable_lower_bound <= x <= variable_upper_bound
+
+    Row classes are encoded by the bounds: equality rows have
+    constraint_lower_bound == constraint_upper_bound, `>=` rows have
+    constraint_upper_bound == +inf, `<=` rows have
+    constraint_lower_bound == -inf, and free rows have both infinite.
+    For LPs, objective_matrix is None (invariant: objective_matrix is None
+    iff is_lp).
 
     Attributes:
     -----------
@@ -188,7 +157,7 @@ class QuadraticProgrammingProblem:
         The vector of variable lower bounds.
     variable_upper_bound : jnp.ndarray
         The vector of variable upper bounds.
-    objective_matrix : BCSR
+    objective_matrix : Union[BCSR, BCOO, jnp.ndarray, None]
         The symmetric and positive semidefinite matrix that defines the quadratic term in the objective.
     objective_vector : jnp.ndarray
         The linear coefficients of the objective function.
@@ -196,14 +165,10 @@ class QuadraticProgrammingProblem:
         The constant term of the objective function.
     constraint_matrix : BCSR
         The matrix of coefficients in the linear constraints.
-    right_hand_side : jnp.ndarray
-        The vector of right-hand side values in the linear constraints.
-    num_equalities : int
-        The number of equalities in the problem.
-    equalities_mask : jnp.ndarray
-        A boolean mask indicating which constraints are equalities.
-    inequalities_mask : jnp.ndarray
-        A boolean mask indicating which constraints are inequalities.
+    constraint_lower_bound : jnp.ndarray
+        The vector of lower bounds on constraint_matrix * x.
+    constraint_upper_bound : jnp.ndarray
+        The vector of upper bounds on constraint_matrix * x.
     is_lp : bool
         Indicates whether the problem is a linear program (True) or a quadratic program (False).
     """
@@ -214,15 +179,13 @@ class QuadraticProgrammingProblem:
     variable_upper_bound: jnp.ndarray
     isfinite_variable_lower_bound: jnp.ndarray
     isfinite_variable_upper_bound: jnp.ndarray
-    objective_matrix: Union[BCSR, BCOO, jnp.ndarray]
+    objective_matrix: Union[BCSR, BCOO, jnp.ndarray, None]
     objective_vector: jnp.ndarray
     objective_constant: float
     constraint_matrix: Union[BCSR, BCOO, jnp.ndarray]
     constraint_matrix_t: Union[BCSR, BCOO, jnp.ndarray]
-    right_hand_side: jnp.ndarray
-    num_equalities: int
-    equalities_mask: jnp.ndarray
-    inequalities_mask: jnp.ndarray
+    constraint_lower_bound: jnp.ndarray
+    constraint_upper_bound: jnp.ndarray
     is_lp: bool
 
 
@@ -718,3 +681,26 @@ def compute_objective_product(problem, primal_solution):
     if problem.is_lp:
         return jnp.zeros_like(primal_solution)
     return problem.objective_matrix @ primal_solution
+
+
+def combined_constraint_bounds(problem):
+    """Per-row scalar standing in for the old right_hand_side in norms.
+
+    Picks the finite constraint bound of larger magnitude (0.0 when neither
+    bound is finite). For problems built from the old standard form this
+    reproduces |right_hand_side| entrywise, keeping cached norms, restart
+    denominators, and the initial primal weight identical.
+    """
+    lower_finite = jnp.where(
+        jnp.isfinite(problem.constraint_lower_bound),
+        problem.constraint_lower_bound,
+        0.0,
+    )
+    upper_finite = jnp.where(
+        jnp.isfinite(problem.constraint_upper_bound),
+        problem.constraint_upper_bound,
+        0.0,
+    )
+    return jnp.where(
+        jnp.abs(lower_finite) > jnp.abs(upper_finite), lower_finite, upper_finite
+    )

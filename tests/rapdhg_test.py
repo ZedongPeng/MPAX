@@ -100,25 +100,14 @@ def test_rapdhg_lp_with_vmap():
     constraint_lb = jnp.array(constraints.lb)
     constraint_ub = jnp.array(constraints.ub)
 
-    eq_mask = constraint_lb == constraint_ub
-    leq_mask = constraint_lb == -jnp.inf
-    geq_mask = constraint_ub == jnp.inf
-    A = BCOO.fromdense(constraints.A[eq_mask])
-    b = jnp.array(constraint_lb[eq_mask])
-
-    leq_G = -constraints.A[leq_mask]
-    leq_rhs = -constraint_ub[leq_mask]
-    geq_G = constraints.A[geq_mask]
-    geq_rhs = constraint_lb[geq_mask]
-    G = BCOO.fromdense(jnp.concatenate([leq_G, geq_G], axis=0))
-    h = jnp.concatenate([leq_rhs, geq_rhs], axis=0)
+    A = BCOO.fromdense(jnp.array(constraints.A))
     var_lb = jnp.array(bounds.lb)
     var_ub = jnp.array(bounds.ub)
 
     solver = raPDHG(eps_abs=1e-6, eps_rel=1e-6)
 
     def solve_single(c):
-        boxed_lp = create_lp(c, A, b, G, h, var_lb, var_ub)
+        boxed_lp = create_lp(c, A, constraint_lb, constraint_ub, var_lb, var_ub)
         result = solver.optimize(boxed_lp)
         return result.primal_objective
 
