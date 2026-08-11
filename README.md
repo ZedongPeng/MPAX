@@ -118,6 +118,7 @@ Distribute computations across devices using JAX’s sharding capabilities. `sol
 
 ```python
 import jax
+from jax.sharding import PartitionSpec as P
 from mpax import create_lp, r2HPDHG
 
 # Data sharding
