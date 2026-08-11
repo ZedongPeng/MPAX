@@ -300,11 +300,6 @@ class RestartInfo:
     primal_distance_moved_last_restart_period: float = 0.0
     dual_distance_moved_last_restart_period: float = 0.0
     reduction_ratio_last_trial: float = 1.0
-    # PID primal-weight controller state (P5); carried through restarts.
-    primal_weight_error_sum: float = 0.0
-    primal_weight_last_error: float = 0.0
-    best_primal_weight: float = 1.0
-    best_primal_dual_residual_gap: float = float("inf")
 
 
 class RestartParameters(NamedTuple):
@@ -336,11 +331,6 @@ class RestartParameters(NamedTuple):
     sufficient_reduction_for_restart: float
     necessary_reduction_for_restart: float
     primal_weight_update_smoothing: float
-    primal_weight_update: str = "smoothing"
-    k_p: float = 0.99
-    k_i: float = 0.01
-    k_d: float = 0.0
-    pid_integral_smoothing: float = 0.3
 
 
 class ScaledQpProblem(NamedTuple):

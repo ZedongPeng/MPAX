@@ -337,11 +337,6 @@ class raPDHG(abc.ABC):
     feasibility_polishing: bool = False
     eps_feas_polish: float = 1e-06
     infeasibility_detection: bool = True
-    primal_weight_update: str = "smoothing"
-    k_p: float = 0.99
-    k_i: float = 0.01
-    k_d: float = 0.0
-    pid_integral_smoothing: float = 0.3
 
     def resolve_config(self, is_lp: bool) -> SolveConfig:
         """Derive the per-solve configuration without mutating the solver.
@@ -349,11 +344,6 @@ class raPDHG(abc.ABC):
         QPs force constant step size, no infeasibility detection, and a
         smaller primal-weight smoothing; LPs use the instance fields as-is.
         """
-        if self.primal_weight_update not in ("smoothing", "pid"):
-            raise ValueError(
-                "primal_weight_update must be 'smoothing' or 'pid', got "
-                f"{self.primal_weight_update!r}"
-            )
         if is_lp:
             adaptive_step_size = self.adaptive_step_size
             infeasibility_detection = self.infeasibility_detection
@@ -385,11 +375,6 @@ class raPDHG(abc.ABC):
             sufficient_reduction_for_restart=self.sufficient_reduction_for_restart,
             necessary_reduction_for_restart=self.necessary_reduction_for_restart,
             primal_weight_update_smoothing=primal_weight_update_smoothing,
-            primal_weight_update=self.primal_weight_update,
-            k_p=self.k_p,
-            k_i=self.k_i,
-            k_d=self.k_d,
-            pid_integral_smoothing=self.pid_integral_smoothing,
         )
         return SolveConfig(
             termination_criteria=termination_criteria,
@@ -575,7 +560,6 @@ class raPDHG(abc.ABC):
             primal_product=scaled_initial_primal_product,
             dual_product=scaled_initial_dual_product,
             primal_obj_product=scaled_primal_obj_product,
-            best_primal_weight=initial_primal_weight,
         )
         return solver_state, last_restart_info, initial_primal_weight
 
@@ -810,18 +794,12 @@ class raPDHG(abc.ABC):
             )
         )
 
-        residual_ratio = (
-            new_convergence_information.relative_dual_residual_norm
-            / new_convergence_information.relative_primal_residual_norm
-        )
-
         restarted_solver_state, new_last_restart_info = run_restart_scheme(
             scaled_problem.scaled_qp,
             solver_state,
             last_restart_info,
             cfg.restart_params,
             self.optimality_norm,
-            residual_ratio=residual_ratio,
         )
 
         new_solver_state = self.take_multiple_steps(

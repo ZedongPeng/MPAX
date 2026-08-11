@@ -32,7 +32,14 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--tol", nargs="*", type=float, default=[1e-4, 1e-8])
     ap.add_argument("--instances", nargs="*", default=list(INSTANCES))
+    ap.add_argument(
+        "--solver-kwarg",
+        action="append",
+        default=[],
+        help="key=value forwarded to every solver constructor; repeatable",
+    )
     args = ap.parse_args()
+    extra_kwargs = dict(kv.split("=", 1) for kv in args.solver_kwarg)
 
     paths = fetch_all()
     rows = []
@@ -40,7 +47,7 @@ def main():
         problem = create_qp_from_gurobi(gp.read(str(paths[name])))
         for solver_name, cls in solvers_for(INSTANCES[name]["is_qp"]):
             for tol in args.tol:
-                solver = cls(eps_abs=tol, eps_rel=tol)
+                solver = cls(eps_abs=tol, eps_rel=tol, **extra_kwargs)
                 t0 = timeit.default_timer()
                 result = solver.optimize(problem)
                 elapsed = timeit.default_timer() - t0
