@@ -58,6 +58,13 @@ def solve(
             "algorithm-specific tuning requires instantiating raPDHG or "
             "r2HPDHG directly."
         )
+    if options.get("warm_start") and (
+        initial_primal_solution is None or initial_dual_solution is None
+    ):
+        raise ValueError(
+            "warm_start=True requires both initial_primal_solution and "
+            "initial_dual_solution"
+        )
     solver_cls = r2HPDHG if problem.is_lp else raPDHG
     solver = solver_cls(**options)
     return solver.optimize(problem, initial_primal_solution, initial_dual_solution)

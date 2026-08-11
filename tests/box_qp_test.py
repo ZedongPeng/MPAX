@@ -145,3 +145,16 @@ def test_create_qp_rejects_wrong_q_shape():
             jnp.ones(2),
             use_sparse_matrix=False,
         )
+
+
+def test_create_lp_rejects_1d_constraint_matrix():
+    with pytest.raises(ValueError, match="2-dimensional"):
+        create_lp(
+            jnp.ones(2),
+            jnp.ones(2),
+            jnp.zeros(1),
+            jnp.ones(1),
+            jnp.zeros(2),
+            jnp.ones(2),
+            use_sparse_matrix=False,
+        )

@@ -84,6 +84,10 @@ def _validate_dimensions(c, A, lc, uc, l, u, Q=None):
     under jit/vmap. Data-dependent validity (lc <= uc, no NaNs) is NOT
     checked here — it cannot raise a Python error at trace time.
     """
+    if len(A.shape) != 2:
+        raise ValueError(
+            f"constraint matrix must be 2-dimensional, got shape {A.shape}"
+        )
     n = c.shape[0]
     if A.shape[1] != n:
         raise ValueError(
@@ -246,7 +250,7 @@ def create_qp_standard_form(Q, c, A, b, G, h, l, u, use_sparse_matrix=True):
 def create_qp_from_gurobi(
     model, use_sparse_matrix=True, sharding=None
 ) -> QuadraticProgrammingProblem:
-    """Transforms a gurobi model to a standard form.
+    """Build a two-sided QuadraticProgrammingProblem from a gurobipy model.
 
     Parameters
     ----------
@@ -260,7 +264,8 @@ def create_qp_from_gurobi(
     Returns
     -------
     QuadraticProgrammingProblem
-        The standard form of the problem.
+        The problem in two-sided form (constraint senses map directly to
+        bounds; `<=` rows are NOT negated, so their duals are nonpositive).
     """
     constraint_sense = np.array(model.getAttr("Sense", model.getConstrs()))
     constraint_rhs = np.array(model.getAttr("RHS", model.getConstrs()))

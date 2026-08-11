@@ -77,3 +77,8 @@ def test_solve_dispatches_qp_to_rapdhg(monkeypatch):
 def test_solve_rejects_algorithm_specific_options():
     with pytest.raises(TypeError, match="restart_scheme"):
         solve(_tiny_lp(), restart_scheme=1)
+
+
+def test_solve_warm_start_requires_initial_solutions():
+    with pytest.raises(ValueError, match="warm_start"):
+        solve(_tiny_lp(), warm_start=True)

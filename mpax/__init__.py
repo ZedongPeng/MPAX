@@ -1,6 +1,11 @@
 """MPAX - A Python package for Mathematical Programming in JAX."""
 
-__version__ = "0.1.0.dev"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("mpax")
+except PackageNotFoundError:  # source tree without an installed distribution
+    __version__ = "0.0.0.dev0"
 
 from .r2hpdhg import r2HPDHG
 from .rapdhg import raPDHG

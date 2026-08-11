@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 
 def estimate_maximum_singular_value(
-    matrix: BCSR,
+    matrix,
     probability_of_failure: float = 0.01,
     desired_relative_error: float = 0.1,
     seed: int = 1,
@@ -65,8 +65,8 @@ def estimate_maximum_singular_value(
 
     Parameters
     ----------
-    matrix : BCSR
-        The sparse matrix in BCSR format.
+    matrix : BCOO, BCSR or jnp.ndarray
+        The matrix (the solver passes BCOO since v0.3).
     probability_of_failure : float, optional
         The acceptable probability of failure.
     desired_relative_error : float, optional
