@@ -40,8 +40,7 @@ Currently, MPAX focuses on solving linear programming (LP) and quadratic program
 \tag{LP}
 \begin{aligned}
 \min_{l \leq x \leq u}\ & c^\top x \\
-\text{s.t.}\ & A x = b \\
-& Gx \geq h
+\text{s.t.}\ & \ell_c \leq A x \leq u_c
 \end{aligned}
 \end{equation}
 ```
@@ -51,45 +50,59 @@ Currently, MPAX focuses on solving linear programming (LP) and quadratic program
 \tag{QP}
 \begin{aligned}
 \min_{l \leq x \leq u}\ & \frac{1}{2} x^\top Q x + c^\top x \\
-\text{s.t.}\ & A x = b \\
-& Gx \geq h
+\text{s.t.}\ & \ell_c \leq A x \leq u_c
 \end{aligned}
 \end{equation}
 ```
+
+Constraint rows are two-sided: equality rows have `lc == uc`, `>=` rows have `uc = +inf`, `<=` rows have `lc = -inf`, and rows with both bounds infinite are free.
 
 MPAX implements two state-of-the-art first-order methods:
 * $\boldsymbol{\mathrm{ra}}$**PDHG**: **restarted average Primal-Dual Hybrid Gradient**, supporting both LP ([paper](https://arxiv.org/abs/2311.12180)) and QP ([paper](https://arxiv.org/abs/2311.07710)). 
 * $\boldsymbol{\mathrm{r^2}}$**HPDHG**: **reflected restarted Halpern Primal-Dual Hybrid Gradient**, supporting LP only ([paper](https://arxiv.org/abs/2407.16144)).
 
+`mpax.solve()` picks the recommended solver automatically: LPs go to r2HPDHG, QPs to raPDHG. The classes remain available for algorithm-specific tuning.
+
 ### Solving a Single LP/QP Problem
 MPAX supports both dense and sparse formats for the constraint matrix, controlled by the `use_sparse_matrix` parameter.
 ```python
-from mpax import create_lp, create_qp, raPDHG, r2HPDHG
+from mpax import create_lp, create_qp, solve
 
-# Create LP using sparse matrix format (default)
-lp = create_lp(c, A, b, G, h, l, u) # use_sparse_matrix=True by default
-# Create LP using dense matrix format
-lp = create_lp(c, A, b, G, h, l, u, use_sparse_matrix=False)
+# min c'x  s.t.  lc <= Ax <= uc,  l <= x <= u
+lp = create_lp(c, A, lc, uc, l, u)          # sparse constraint matrix (default)
+lp = create_lp(c, A, lc, uc, l, u, use_sparse_matrix=False)  # dense
+result = solve(lp, eps_abs=1e-4, eps_rel=1e-4, verbose=True)
+
+# min 1/2 x'Qx + c'x  s.t.  lc <= Ax <= uc,  l <= x <= u
+qp = create_qp(Q, c, A, lc, uc, l, u)
+result = solve(qp, eps_abs=1e-4, eps_rel=1e-4, verbose=True)
+```
+
+**Advanced: direct solver classes.** `solve()` only exposes the algorithm-agnostic options listed under [Solver Options](#solver-options). To tune algorithm-specific knobs (restart thresholds, step-size exponents, ...), instantiate `raPDHG` or `r2HPDHG` directly and call `.optimize()`:
+```python
+from mpax import create_lp, r2HPDHG
+
+lp = create_lp(c, A, lc, uc, l, u)
 solver = r2HPDHG(eps_abs=1e-4, eps_rel=1e-4, verbose=True)
-result = solver.optimize(lp)
-
-# Or create QP
-qp = create_qp(Q, c, A, b, G, h, l, u)
-qp = create_qp(Q, c, A, b, G, h, l, u, use_sparse_matrix=False)
-solver = raPDHG(eps_abs=1e-4, eps_rel=1e-4, verbose=True)
 result = solver.optimize(lp)
 ```
 
+### Migrating from v0.2
+
+* `create_lp(c, A, b, G, h, l, u)` / `create_qp(Q, c, A, b, G, h, l, u)` (pre-v0.3) became `create_lp(c, A, lc, uc, l, u)` / `create_qp(Q, c, A, lc, uc, l, u)` — constraints are now expressed as two-sided `lc <= Ax <= uc` bounds instead of separate equality (`Ax = b`) and inequality (`Gx >= h`) blocks. One-release compatibility wrappers `create_lp_standard_form(c, A, b, G, h, l, u)` / `create_qp_standard_form(Q, c, A, b, G, h, l, u)` reproduce the old semantics and emit a `DeprecationWarning`; they will be removed in v0.4.
+* Duals of `<=` rows changed sign: rows are no longer negated internally, so the dual of a binding `<=` row is now nonpositive (the standard convention).
+* For LPs, `objective_matrix` is `None` (no dense zero allocation).
+
 ### Batch solving
-Batch solving allows you to solve multiple LP problems of the same shape simultaneously by using `jax.vmap`:
+Batch solving allows you to solve multiple LP problems of the same shape simultaneously by using `jax.vmap`. `solve()` is vmap-compatible since solver dispatch is resolved at trace time:
 ```python
+import jax
 import jax.numpy as jnp
-from mpax import create_lp, r2HPDHG
+from mpax import create_lp, solve
 
 def single_optimize(c_vector):
-    lp = create_lp(c_vector, A, b, G, h, l, u)
-    solver = r2HPDHG(eps_abs=1e-4, eps_rel=1e-4, verbose=True)
-    result = solver.optimize(lp)
+    lp = create_lp(c_vector, A, lc, uc, l, u)
+    result = solve(lp, eps_abs=1e-4, eps_rel=1e-4)
     obj = jnp.dot(c_vector, result.primal_solution)
     return result.primal_solution, obj
 
@@ -101,18 +114,18 @@ result = batch_optimize(batch_c)
 ```
 
 ### Device parallelism
-Distribute computations across devices using JAX’s sharding capabilities:
+Distribute computations across devices using JAX’s sharding capabilities. `solve()` works here too, but this example keeps the explicit `r2HPDHG` class to show `jax.jit` applied directly to `.optimize`:
 
 ```python
 import jax
-from mpax import create_lp
+from mpax import create_lp, r2HPDHG
 
 # Data sharding
 mesh = jax.make_mesh((2,), ('x',))
 sharding = jax.sharding.NamedSharding(mesh, P('x',))
 
 A_sharded = jax.device_put(A, sharding)
-lp_sharded = create_lp(c, A_sharded, b, G, h, l, u)
+lp_sharded = create_lp(c, A_sharded, lc, uc, l, u)
 
 solver = r2HPDHG(eps_abs=1e-4, eps_rel=1e-4, verbose=True)
 jit_optimize = jax.jit(solver.optimize)
