@@ -29,7 +29,7 @@
   benchmark set, ~27% lower median solve time, identical iteration
   counts (`benchmarks/results/2026-08-10-matvec.txt`).
 - Solver configuration is resolved per-solve into an immutable
-  `SolveConfig`; solver instances are no longer mutated by `optimize`
+  `SolveConfig`; solver configuration is no longer mutated by `optimize`
   (a QP solve no longer degrades subsequent LP solves on the same
   instance).
 
@@ -57,4 +57,4 @@
 - PID primal-weight controller (from the mpax-dev reference): benchmark
   showed the smoothing rule dominates on both LPs and QPs; the port was
   removed per the design's no-dead-switch rule (implementation preserved
-  in git history at 43d3d89).
+  in this branch's pre-merge history at 43d3d89).

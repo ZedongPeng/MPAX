@@ -116,7 +116,8 @@ def create_lp(c, A, lc, uc, l, u, use_sparse_matrix=True):
                  l <= x <= u
 
     Row classes are encoded by the bounds: equality rows have lc == uc,
-    `>=` rows have uc = +inf, `<=` rows have lc = -inf.
+    `>=` rows have uc = +inf, `<=` rows have lc = -inf, and rows with both
+    bounds infinite are free.
 
     Parameters
     ----------

@@ -5,3 +5,6 @@ tmp/
 /experiments
 .pytest_cache
 benchmarks/cache/
+dist/
+data/
+*.pdf
