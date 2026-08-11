@@ -344,18 +344,10 @@ def rescale_problem(
         )
     display_problem_details(problem)
 
-    if isinstance(original_problem.constraint_matrix, BCOO):
-        original_problem.constraint_matrix = BCSR.from_bcoo(
-            original_problem.constraint_matrix
-        )
-    if isinstance(original_problem.constraint_matrix_t, BCOO):
-        original_problem.constraint_matrix_t = BCSR.from_bcoo(
-            original_problem.constraint_matrix_t
-        )
-    if isinstance(problem.constraint_matrix, BCOO):
-        problem.constraint_matrix = BCSR.from_bcoo(problem.constraint_matrix)
-    if isinstance(problem.constraint_matrix_t, BCOO):
-        problem.constraint_matrix_t = BCSR.from_bcoo(problem.constraint_matrix_t)
+    # Benchmark-backed choice (P6, 2026-08-10): BCOO beats BCSR on both matvec
+    # directions on 4/5 instances (see benchmarks/results/2026-08-10-matvec.txt),
+    # so the constraint matrices stay BCOO end-to-end instead of converting
+    # back to BCSR here.
     scaled_problem = ScaledQpProblem(
         original_qp=original_problem,
         scaled_qp=problem,
