@@ -492,6 +492,7 @@ def perform_restart(
     last_restart_info,
     kkt_reduction_ratio,
     restart_params,
+    residual_ratio=None,
 ):
     restart_length = solver_state.solutions_count
     (
@@ -548,13 +549,37 @@ def perform_restart(
         dual_distance_moved_last_restart_period=dual_distance_moved_last_restart_period,
         reduction_ratio_last_trial=kkt_reduction_ratio,
         primal_obj_product=restarted_primal_obj_product,
+        primal_weight_error_sum=last_restart_info.primal_weight_error_sum,
+        primal_weight_last_error=last_restart_info.primal_weight_last_error,
+        best_primal_weight=last_restart_info.best_primal_weight,
+        best_primal_dual_residual_gap=last_restart_info.best_primal_dual_residual_gap,
     )
 
-    new_primal_weight = compute_new_primal_weight(
-        new_last_restart_info,
-        solver_state.primal_weight,
-        restart_params.primal_weight_update_smoothing,
-    )
+    if restart_params.primal_weight_update == "pid" and residual_ratio is not None:
+        (
+            new_primal_weight,
+            new_error_sum,
+            new_last_error,
+            new_best_weight,
+            new_best_gap,
+        ) = compute_new_primal_weight_pid(
+            new_last_restart_info,
+            solver_state.primal_weight,
+            residual_ratio,
+            restart_params,
+        )
+        new_last_restart_info = new_last_restart_info.replace(
+            primal_weight_error_sum=new_error_sum,
+            primal_weight_last_error=new_last_error,
+            best_primal_weight=new_best_weight,
+            best_primal_dual_residual_gap=new_best_gap,
+        )
+    else:
+        new_primal_weight = compute_new_primal_weight(
+            new_last_restart_info,
+            solver_state.primal_weight,
+            restart_params.primal_weight_update_smoothing,
+        )
 
     # The initial point of the restart will not counted into the average.
     # The weight (step size) of the initial point is zero.
@@ -595,6 +620,7 @@ def run_restart_scheme(
     last_restart_info: RestartInfo,
     restart_params: RestartParameters,
     norm_ord: float,
+    residual_ratio=None,
 ):
     """
     Check restart criteria based on current and average KKT residuals.
@@ -633,6 +659,7 @@ def run_restart_scheme(
             last_restart_info,
             kkt_reduction_ratio,
             restart_params,
+            residual_ratio,
         ),
         lambda: (solver_state, last_restart_info),
     )
@@ -724,6 +751,78 @@ def compute_new_primal_weight(
         lambda: primal_weight,
     )
     return new_primal_weight
+
+
+def compute_new_primal_weight_pid(
+    last_restart_info: RestartInfo,
+    primal_weight: float,
+    residual_ratio: float,
+    restart_params: RestartParameters,
+):
+    """PID-controlled primal weight at restart (P5, ported from mpax-dev).
+
+    error = log(dual_distance) - log(primal_distance) - log(weight); with
+    k_i = k_d = 0 and k_p = smoothing this reduces to the smoothing rule.
+    Out-of-range iterates (degenerate distances or residual ratio) reset
+    the controller to the best weight seen so far, judged by
+    |log10(dual_residual / primal_residual)|.
+
+    Returns
+    -------
+    tuple
+        (new_weight, new_error_sum, new_last_error, new_best_weight,
+        new_best_gap)
+    """
+    primal_distance = last_restart_info.primal_distance_moved_last_restart_period
+    dual_distance = last_restart_info.dual_distance_moved_last_restart_period
+
+    def pid_branch(_):
+        error = (
+            jnp.log(dual_distance) - jnp.log(primal_distance) - jnp.log(primal_weight)
+        )
+        new_error_sum = (
+            last_restart_info.primal_weight_error_sum
+            * restart_params.pid_integral_smoothing
+            + error
+        )
+        delta_error = error - last_restart_info.primal_weight_last_error
+        update = (
+            restart_params.k_p * error
+            + restart_params.k_i * new_error_sum
+            + restart_params.k_d * delta_error
+        )
+        return primal_weight * jnp.exp(update), new_error_sum, error
+
+    def reset_branch(_):
+        return last_restart_info.best_primal_weight, 0.0, 0.0
+
+    use_pid = (
+        (primal_distance > 1e-16)
+        & (dual_distance > 1e-16)
+        & (primal_distance < 1e12)
+        & (dual_distance < 1e12)
+        & (residual_ratio > 1e-8)
+        & (residual_ratio < 1e8)
+    )
+    new_primal_weight, new_error_sum, new_last_error = jax.lax.cond(
+        use_pid, pid_branch, reset_branch, operand=None
+    )
+
+    gap = jnp.abs(jnp.log10(residual_ratio))
+    is_better = gap < last_restart_info.best_primal_dual_residual_gap
+    new_best_gap = jnp.where(
+        is_better, gap, last_restart_info.best_primal_dual_residual_gap
+    )
+    new_best_weight = jnp.where(
+        is_better, new_primal_weight, last_restart_info.best_primal_weight
+    )
+    return (
+        new_primal_weight,
+        new_error_sum,
+        new_last_error,
+        new_best_weight,
+        new_best_gap,
+    )
 
 
 def select_initial_primal_weight(

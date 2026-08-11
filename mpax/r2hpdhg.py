@@ -10,6 +10,7 @@ from mpax.preprocess import rescale_problem
 from mpax.rapdhg import compute_next_solution, line_search, raPDHG
 from mpax.restart import (
     compute_new_primal_weight,
+    compute_new_primal_weight_pid,
     restart_criteria_met_fixed_point,
     unscaled_saddle_point_output,
     weighted_norm,
@@ -88,6 +89,11 @@ class r2HPDHG(raPDHG):
     feasibility_polishing: bool = False
     eps_feas_polish: float = 1e-06
     infeasibility_detection: bool = True
+    primal_weight_update: str = "smoothing"
+    k_p: float = 0.99
+    k_i: float = 0.01
+    k_d: float = 0.0
+    pid_integral_smoothing: float = 0.3
 
     def resolve_config(self, is_lp: bool) -> SolveConfig:
         if not is_lp:
@@ -192,7 +198,13 @@ class r2HPDHG(raPDHG):
         )
 
     def perform_restart(
-        self, solver_state, last_restart_info, kkt_reduction_ratio, problem, cfg
+        self,
+        solver_state,
+        last_restart_info,
+        kkt_reduction_ratio,
+        problem,
+        cfg,
+        residual_ratio=None,
     ):
         # Take a pure PDHG step to get the new solution and set it as the initial solution for the outer iteration.
         # Use the pure PDHG step solution, instead of the Halpen PDHG step solution, as the initial solution for the restart.
@@ -281,13 +293,41 @@ class r2HPDHG(raPDHG):
             primal_distance_moved_last_restart_period=primal_distance_moved_last_restart_period,
             dual_distance_moved_last_restart_period=dual_distance_moved_last_restart_period,
             reduction_ratio_last_trial=kkt_reduction_ratio,
+            primal_weight_error_sum=last_restart_info.primal_weight_error_sum,
+            primal_weight_last_error=last_restart_info.primal_weight_last_error,
+            best_primal_weight=last_restart_info.best_primal_weight,
+            best_primal_dual_residual_gap=last_restart_info.best_primal_dual_residual_gap,
         )
 
-        restarted_solver_state.primal_weight = compute_new_primal_weight(
-            new_last_restart_info,
-            solver_state.primal_weight,
-            cfg.primal_weight_update_smoothing,
-        )
+        if (
+            cfg.restart_params.primal_weight_update == "pid"
+            and residual_ratio is not None
+        ):
+            (
+                new_weight,
+                new_error_sum,
+                new_last_error,
+                new_best_weight,
+                new_best_gap,
+            ) = compute_new_primal_weight_pid(
+                new_last_restart_info,
+                solver_state.primal_weight,
+                residual_ratio,
+                cfg.restart_params,
+            )
+            new_last_restart_info = new_last_restart_info.replace(
+                primal_weight_error_sum=new_error_sum,
+                primal_weight_last_error=new_last_error,
+                best_primal_weight=new_best_weight,
+                best_primal_dual_residual_gap=new_best_gap,
+            )
+            restarted_solver_state.primal_weight = new_weight
+        else:
+            restarted_solver_state.primal_weight = compute_new_primal_weight(
+                new_last_restart_info,
+                solver_state.primal_weight,
+                cfg.primal_weight_update_smoothing,
+            )
         restarted_solver_state.solutions_count = 0
         restarted_solver_state.weights_sum = 0.0
 
@@ -299,6 +339,7 @@ class r2HPDHG(raPDHG):
         solver_state: PdhgSolverState,
         last_restart_info: RestartInfo,
         cfg: SolveConfig,
+        residual_ratio=None,
     ):
         """
         Check restart criteria based on current and average KKT residuals.
@@ -329,7 +370,12 @@ class r2HPDHG(raPDHG):
         return cond(
             do_restart,
             lambda: self.perform_restart(
-                solver_state, last_restart_info, kkt_reduction_ratio, problem, cfg
+                solver_state,
+                last_restart_info,
+                kkt_reduction_ratio,
+                problem,
+                cfg,
+                residual_ratio,
             ),
             lambda: (solver_state, last_restart_info),
         )
@@ -453,8 +499,17 @@ class r2HPDHG(raPDHG):
             )
         )
 
+        residual_ratio = (
+            convergence_information.relative_dual_residual_norm
+            / convergence_information.relative_primal_residual_norm
+        )
+
         restarted_solver_state, new_last_restart_info = self.run_restart_scheme(
-            scaled_problem.scaled_qp, solver_state, last_restart_info, cfg
+            scaled_problem.scaled_qp,
+            solver_state,
+            last_restart_info,
+            cfg,
+            residual_ratio=residual_ratio,
         )
 
         new_solver_state = self.take_multiple_steps(
