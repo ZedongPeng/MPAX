@@ -1,0 +1,39 @@
+instance        variant        A@x (us)  At@y (us) ratio_fwd   ratio_t
+Set parameter Username
+Academic license - for non-commercial use only - expires 2027-02-09
+Read MPS format model from file /Users/zedongpeng/Github/MPAX/benchmarks/cache/gen-ip054.mps
+Reading time = 0.00 seconds
+gen-ip054: 27 rows, 30 columns, 532 nonzeros
+gen-ip054       bcsr               83.2       85.0     1.000     1.000
+gen-ip054       bcoo               61.7       62.1     0.741     0.731
+gen-ip054       bcoo_sorted        62.1       62.5     0.746     0.736
+gen-ip054       csr                83.8       87.7     1.007     1.033
+Read MPS format model from file /Users/zedongpeng/Github/MPAX/benchmarks/cache/flugpl.mps
+Reading time = 0.00 seconds
+flugpl: 18 rows, 18 columns, 46 nonzeros
+flugpl          bcsr               27.7       24.8     1.000     1.000
+flugpl          bcoo               24.0       23.6     0.866     0.951
+flugpl          bcoo_sorted        22.8       23.4     0.822     0.943
+flugpl          csr                29.2       31.2     1.054     1.260
+Read MPS format model from file /Users/zedongpeng/Github/MPAX/benchmarks/cache/qpdata/AUG2DC.QPS
+Reading time = 0.04 seconds
+AUG2DC: 10000 rows, 20200 columns, 40000 nonzeros
+AUG2DC          bcsr             4350.1     5073.4     1.000     1.000
+AUG2DC          bcoo             3354.8     3261.0     0.771     0.643
+AUG2DC          bcoo_sorted      3185.6     3210.5     0.732     0.633
+AUG2DC          csr              4753.1     5511.1     1.093     1.086
+Read MPS format model from file /Users/zedongpeng/Github/MPAX/benchmarks/cache/qpdata/AUG3DCQP.QPS
+Reading time = 0.01 seconds
+AUG3DCQP: 1000 rows, 3873 columns, 6546 nonzeros
+AUG3DCQP        bcsr              738.6      971.5     1.000     1.000
+AUG3DCQP        bcoo              542.3      579.5     0.734     0.596
+AUG3DCQP        bcoo_sorted       535.7      545.3     0.725     0.561
+AUG3DCQP        csr               769.5      995.9     1.042     1.025
+Read MPS format model from file /Users/zedongpeng/Github/MPAX/benchmarks/cache/knapsack-2000.mps
+Reading time = 0.00 seconds
+knapsack: 1 rows, 2000 columns, 2000 nonzeros
+knapsack-2000   bcsr              219.9      364.8     1.000     1.000
+knapsack-2000   bcoo              180.0      178.2     0.819     0.489
+knapsack-2000   bcoo_sorted       179.4      179.0     0.816     0.491
+knapsack-2000   csr               220.4      416.0     1.002     1.140
+VERDICT: ADOPT bcoo (beats bcsr on both directions on 4/5 instances)
