@@ -4,7 +4,7 @@ Usage:
     $PY -m benchmarks.matvec_bench [--reps 200]
 
 Times y = A @ x and z = At @ y for each registry instance's constraint
-matrix in four formats: BCSR (the solver's current format), BCOO, sorted
+matrix in four formats: BCSR (the solver's format before the 2026-08-10 adoption of BCOO — the ratio baseline), BCOO (the solver's current format, adopted per the recorded verdict), sorted
 BCOO, and CSR via jax.experimental.sparse.csr_matvec. The transpose is
 stored explicitly per format, mirroring the solver (constraint_matrix_t
 is a materialized transpose, never a transposed view).
