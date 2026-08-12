@@ -59,8 +59,12 @@ from mpax.iteration_stats_utils import compute_convergence_information
 logger = logging.getLogger(__name__)
 
 
+@jax.jit
 def power_method_sigma_max(matrix, matrix_t, tolerance=1e-4, max_iterations=400):
     """sigma_max of A by power iteration on A A', stopped on the eigenpair residual.
+
+    jitted at module level so repeated solves of same-shaped problems reuse
+    the compilation (an eagerly-invoked lax.while_loop recompiles per call).
 
     The shared `estimate_maximum_singular_value` stops on a probabilistic
     bound and spends ~300 iterations whatever the instance. This stops as
@@ -798,21 +802,28 @@ class r2HPDHG(raPDHG):
         ) = init_primal_feasibility_polishing(
             scaled_problem, solver_state, initial_primal_weight, average=False
         )
-        (new_solver_state, last_restart_info, should_terminate, _, _) = while_loop(
-            cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.primal_feasibility_polishing_iterate(
-                cfg, *state
+        polish_loop = self._cached_loop(
+            "primal_polish",
+            True,
+            lambda: lambda init_val: while_loop(
+                cond_fun=lambda state: state[2] == False,
+                body_fun=lambda state: self.primal_feasibility_polishing_iterate(
+                    cfg, *state
+                ),
+                init_val=init_val,
+                maxiter=self.iteration_limit,
+                unroll=self.unroll,
+                jit=self.jit,
             ),
-            init_val=(
+        )
+        (new_solver_state, last_restart_info, should_terminate, _, _) = polish_loop(
+            (
                 primal_feasibility_solver_state,
                 last_restart_info,
                 False,
                 primal_feasibility_problem,
                 qp_cache,
-            ),
-            maxiter=self.iteration_limit,
-            unroll=self.unroll,
-            jit=self.jit,
+            )
         )
         return new_solver_state.current_primal_solution, should_terminate
 
@@ -890,19 +901,28 @@ class r2HPDHG(raPDHG):
             )
         )
 
-        (new_solver_state, last_restart_info, should_terminate, _, _) = while_loop(
-            cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.dual_feasibility_polishing_iterate(cfg, *state),
-            init_val=(
+        polish_loop = self._cached_loop(
+            "dual_polish",
+            True,
+            lambda: lambda init_val: while_loop(
+                cond_fun=lambda state: state[2] == False,
+                body_fun=lambda state: self.dual_feasibility_polishing_iterate(
+                    cfg, *state
+                ),
+                init_val=init_val,
+                maxiter=self.iteration_limit,
+                unroll=self.unroll,
+                jit=self.jit,
+            ),
+        )
+        (new_solver_state, last_restart_info, should_terminate, _, _) = polish_loop(
+            (
                 dual_feasibility_solver_state,
                 last_restart_info,
                 False,
                 dual_feasibility_problem,
                 qp_cache,
-            ),
-            maxiter=self.iteration_limit,
-            unroll=self.unroll,
-            jit=self.jit,
+            )
         )
         return new_solver_state.current_dual_solution, should_terminate
 
@@ -1007,20 +1027,27 @@ class r2HPDHG(raPDHG):
         # termination_evaluation_frequency iterations. The 10 single-step
         # iterations that used to run here shifted every later check by 10
         # and made iteration counts incomparable with the reference.
-        (solver_state, last_restart_info, should_terminate, _, _, ci) = while_loop(
-            cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.main_iteration_update(cfg, *state),
-            init_val=(
+        main_loop = self._cached_loop(
+            "main",
+            True,
+            lambda: lambda init_val: while_loop(
+                cond_fun=lambda state: state[2] == False,
+                body_fun=lambda state: self.main_iteration_update(cfg, *state),
+                init_val=init_val,
+                maxiter=self.iteration_limit,
+                unroll=self.unroll,
+                jit=self.jit,
+            ),
+        )
+        (solver_state, last_restart_info, should_terminate, _, _, ci) = main_loop(
+            (
                 solver_state,
                 last_restart_info,
                 False,
                 scaled_problem,
                 qp_cache,
                 ConvergenceInformation(),
-            ),
-            maxiter=self.iteration_limit,
-            unroll=self.unroll,
-            jit=self.jit,
+            )
         )
         iteration_time = timeit.default_timer() - iteration_start_time
 

@@ -1,7 +1,7 @@
 import abc
 import logging
 import timeit
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Tuple
 
 import jax
@@ -384,6 +384,30 @@ class raPDHG(abc.ABC):
             infeasibility_detection=infeasibility_detection,
             primal_weight_update_smoothing=primal_weight_update_smoothing,
         )
+
+    def _cached_loop(self, name, is_lp, build):
+        """A jitted iteration loop reused across optimize() calls.
+
+        lax control flow invoked with per-call closures retraces and
+        recompiles on every call (jaxprs hash by identity), which cost
+        ~0.5 s per solve on GPU even for repeated same-shape problems.
+        jax.jit caches on the callable's identity, so each loop closure is
+        built once and kept on the instance. Every dataclass field is
+        baked into that closure as a compile-time constant (via the cfg it
+        closes over), so the cache is invalidated whenever any field -- or
+        the LP/QP kind -- changes. Problem shape changes need no
+        invalidation: jax.jit keys on argument shapes itself.
+        """
+        key = (is_lp, tuple((f.name, getattr(self, f.name)) for f in fields(self)))
+        if self.__dict__.get("_loop_cache_key") != key:
+            self._loop_cache = {}
+            self._loop_cache_key = key
+        if name not in self._loop_cache:
+            fn = build()
+            # jit=False asks for the pure-Python loop (debuggable, not
+            # traceable); hand back the bare closure unchanged.
+            self._loop_cache[name] = jax.jit(fn) if self.jit else fn
+        return self._loop_cache[name]
 
     def calculate_constant_step_size(
         self, primal_weight, iteration, last_step_size
@@ -855,21 +879,28 @@ class raPDHG(abc.ABC):
         ) = init_primal_feasibility_polishing(
             scaled_problem, solver_state, initial_primal_weight
         )
-        (new_solver_state, last_restart_info, should_terminate, _, _) = while_loop(
-            cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.primal_feasibility_polishing_iterate(
-                cfg, *state
+        polish_loop = self._cached_loop(
+            "primal_polish",
+            scaled_problem.scaled_qp.is_lp,
+            lambda: lambda init_val: while_loop(
+                cond_fun=lambda state: state[2] == False,
+                body_fun=lambda state: self.primal_feasibility_polishing_iterate(
+                    cfg, *state
+                ),
+                init_val=init_val,
+                maxiter=self.iteration_limit,
+                unroll=self.unroll,
+                jit=self.jit,
             ),
-            init_val=(
+        )
+        (new_solver_state, last_restart_info, should_terminate, _, _) = polish_loop(
+            (
                 primal_feasibility_solver_state,
                 last_restart_info,
                 False,
                 primal_feasibility_problem,
                 qp_cache,
-            ),
-            maxiter=self.iteration_limit,
-            unroll=self.unroll,
-            jit=self.jit,
+            )
         )
         return new_solver_state.avg_primal_solution, should_terminate
 
@@ -948,19 +979,28 @@ class raPDHG(abc.ABC):
             )
         )
 
-        (new_solver_state, last_restart_info, should_terminate, _, _) = while_loop(
-            cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.dual_feasibility_polishing_iterate(cfg, *state),
-            init_val=(
+        polish_loop = self._cached_loop(
+            "dual_polish",
+            scaled_problem.scaled_qp.is_lp,
+            lambda: lambda init_val: while_loop(
+                cond_fun=lambda state: state[2] == False,
+                body_fun=lambda state: self.dual_feasibility_polishing_iterate(
+                    cfg, *state
+                ),
+                init_val=init_val,
+                maxiter=self.iteration_limit,
+                unroll=self.unroll,
+                jit=self.jit,
+            ),
+        )
+        (new_solver_state, last_restart_info, should_terminate, _, _) = polish_loop(
+            (
                 dual_feasibility_solver_state,
                 last_restart_info,
                 False,
                 dual_feasibility_problem,
                 qp_cache,
-            ),
-            maxiter=self.iteration_limit,
-            unroll=self.unroll,
-            jit=self.jit,
+            )
         )
         return new_solver_state.avg_dual_solution, should_terminate
 
@@ -1066,29 +1106,43 @@ class raPDHG(abc.ABC):
 
         iteration_start_time = timeit.default_timer()
         # Initial iterations, where restart will be checked every iteration.
-        (solver_state, last_restart_info, should_terminate, _, _) = while_loop(
-            cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.initial_iteration_update(cfg, *state),
-            init_val=(solver_state, last_restart_info, False, scaled_problem, qp_cache),
-            maxiter=10,
-            unroll=self.unroll,
-            jit=self.jit,
+        initial_loop = self._cached_loop(
+            "initial",
+            original_problem.is_lp,
+            lambda: lambda init_val: while_loop(
+                cond_fun=lambda state: state[2] == False,
+                body_fun=lambda state: self.initial_iteration_update(cfg, *state),
+                init_val=init_val,
+                maxiter=10,
+                unroll=self.unroll,
+                jit=self.jit,
+            ),
+        )
+        (solver_state, last_restart_info, should_terminate, _, _) = initial_loop(
+            (solver_state, last_restart_info, False, scaled_problem, qp_cache)
         )
 
-        (solver_state, last_restart_info, should_terminate, _, _, ci) = while_loop(
-            cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.main_iteration_update(cfg, *state),
-            init_val=(
+        main_loop = self._cached_loop(
+            "main",
+            original_problem.is_lp,
+            lambda: lambda init_val: while_loop(
+                cond_fun=lambda state: state[2] == False,
+                body_fun=lambda state: self.main_iteration_update(cfg, *state),
+                init_val=init_val,
+                maxiter=self.iteration_limit,
+                unroll=self.unroll,
+                jit=self.jit,
+            ),
+        )
+        (solver_state, last_restart_info, should_terminate, _, _, ci) = main_loop(
+            (
                 solver_state,
                 last_restart_info,
                 False,
                 scaled_problem,
                 qp_cache,
                 ConvergenceInformation(),
-            ),
-            maxiter=self.iteration_limit,
-            unroll=self.unroll,
-            jit=self.jit,
+            )
         )
         iteration_time = timeit.default_timer() - iteration_start_time
 

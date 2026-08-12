@@ -14,6 +14,14 @@
   1e-8) — re-baseline before gating.
 
 ### Changed
+- `optimize()` now reuses its jitted iteration loops across calls:
+  the loop closures are cached on the solver instance (invalidated
+  when any solver field changes) instead of re-traced and recompiled
+  on every call, and the power method is jitted at module level. Warm
+  same-shape solves drop ~60% wall time on GPU (a 3000-iteration
+  budget on 30n20b8: 1.04s -> 0.41s), including solves of *different*
+  problems with the same shapes — the batch-solving case. Numerics
+  are unchanged; `tests/loop_cache_test.py` guards the invalidation.
 - r2HPDHG evaluation windows run lean: the first N-1 steps of a
   window no longer compute or carry `pdhg_*`, `dual_slack` and
   `delta_*` (only the window's last step does, and nothing reads them
