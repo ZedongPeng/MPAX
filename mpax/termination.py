@@ -3,7 +3,10 @@ from typing import Union
 import jax
 import jax.numpy as jnp
 
-from mpax.iteration_stats_utils import evaluate_unscaled_iteration_stats
+from mpax.iteration_stats_utils import (
+    compute_cupdlpx_convergence_information,
+    evaluate_unscaled_iteration_stats,
+)
 from mpax.utils import (
     CachedQuadraticProgramInfo,
     ConvergenceInformation,
@@ -15,6 +18,73 @@ from mpax.utils import (
     combined_constraint_bounds,
     safe_norm,
 )
+
+
+def check_termination_criteria_cupdlpx(
+    scaled_problem,
+    solver_state,
+    criteria: TerminationCriteria,
+    qp_cache: CachedQuadraticProgramInfo,
+    numerical_error: bool,
+    norm_ord: float = 2,
+    infeasibility_detection: bool = True,
+):
+    """cuPDLP-x's termination test, for the r2HPDHG LP path.
+
+    Optimality is measured the reference's way. The reference carries no
+    infeasibility certificates, so those checks are skipped when
+    infeasibility_detection is off (which is what makes iteration counts
+    comparable to it); with the flag on, MPAX's certificates still apply.
+    """
+    ci = compute_cupdlpx_convergence_information(
+        scaled_problem, qp_cache, solver_state, norm_ord
+    )
+    should_terminate, termination_status = jax.lax.cond(
+        optimality_criteria_met(criteria.eps_rel, ci),
+        lambda: (True, TerminationStatus.OPTIMAL),
+        lambda: (False, TerminationStatus.UNSPECIFIED),
+    )
+
+    if infeasibility_detection:
+        infeasibility_information = evaluate_unscaled_iteration_stats(
+            scaled_problem,
+            qp_cache,
+            solver_state,
+            1.0,
+            criteria.eps_abs / criteria.eps_rel,
+            norm_ord,
+            False,
+            True,
+        ).infeasibility_information
+        should_terminate, termination_status = jax.lax.cond(
+            (should_terminate == False)
+            & primal_infeasibility_criteria_met(
+                criteria.eps_primal_infeasible, infeasibility_information
+            ),
+            lambda: (True, TerminationStatus.PRIMAL_INFEASIBLE),
+            lambda: (should_terminate, termination_status),
+        )
+        should_terminate, termination_status = jax.lax.cond(
+            (should_terminate == False)
+            & dual_infeasibility_criteria_met(
+                criteria.eps_dual_infeasible, infeasibility_information
+            ),
+            lambda: (True, TerminationStatus.DUAL_INFEASIBLE),
+            lambda: (should_terminate, termination_status),
+        )
+
+    should_terminate, termination_status = jax.lax.cond(
+        (should_terminate == False)
+        & (solver_state.num_iterations >= criteria.iteration_limit),
+        lambda: (True, TerminationStatus.ITERATION_LIMIT),
+        lambda: (should_terminate, termination_status),
+    )
+    should_terminate, termination_status = jax.lax.cond(
+        (should_terminate == False) & numerical_error,
+        lambda: (True, TerminationStatus.NUMERICAL_ERROR),
+        lambda: (should_terminate, termination_status),
+    )
+    return should_terminate, termination_status, ci
 
 
 def validate_termination_criteria(criteria: TerminationCriteria) -> None:

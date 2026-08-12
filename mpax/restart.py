@@ -56,8 +56,17 @@ def unscaled_saddle_point_output(
     SaddlePointOutput
         The unscaled primal and dual solutions along with other details.
     """
-    original_primal_solution = primal_solution / scaled_problem.variable_rescaling
-    original_dual_solution = dual_solution / scaled_problem.constraint_rescaling
+    # The two scalar factors are 1.0 unless bound_objective_rescaling ran.
+    original_primal_solution = (
+        primal_solution
+        / scaled_problem.variable_rescaling
+        / scaled_problem.constraint_bound_rescaling
+    )
+    original_dual_solution = (
+        dual_solution
+        / scaled_problem.constraint_rescaling
+        / scaled_problem.objective_vector_rescaling
+    )
 
     return SaddlePointOutput(
         primal_solution=original_primal_solution,
@@ -393,6 +402,76 @@ def should_do_adaptive_restart_fixed_point(
         lambda: False,
     )
     return do_restart, reduction_ratio
+
+
+def compute_cupdlpx_fixed_point_error(
+    primal_diff, dual_diff, primal_diff_product, step_size, primal_weight
+):
+    """cuPDLP-x's fixed-point error, used by the r2HPDHG restart test.
+
+    Three things differ from `compute_fixed_point_residual`, and each one
+    moves restart timing: the movement terms are weighted by primal_weight
+    rather than by (primal_weight / step_size)**2, the interaction term
+    keeps its sign instead of being wrapped in abs(), and the sum is
+    square-rooted.
+
+    <A dx, dy> == <dx, A' dy>, so the cached primal_diff_product stands in
+    for the reference implementation's extra A' dy matvec.
+    """
+    interaction = 2 * step_size * jnp.dot(primal_diff_product, dual_diff)
+    movement = (
+        jnp.dot(primal_diff, primal_diff) * primal_weight
+        + jnp.dot(dual_diff, dual_diff) / primal_weight
+    )
+    return jnp.sqrt(movement + interaction)
+
+
+def should_do_adaptive_restart_cupdlpx(
+    restart_params, solver_state, last_restart_info, termination_evaluation_frequency
+):
+    """cuPDLP-x's restart test.
+
+    Reductions are measured against the fixed-point error re-probed just
+    after the last restart (not against the error at the last restart
+    point), and the first check always restarts.
+    """
+    fixed_point_error = compute_cupdlpx_fixed_point_error(
+        solver_state.delta_primal,
+        solver_state.delta_dual,
+        solver_state.delta_primal_product,
+        solver_state.step_size,
+        solver_state.primal_weight,
+    )
+    initial_error = last_restart_info.initial_fixed_point_error
+
+    is_first_check = solver_state.num_iterations == termination_evaluation_frequency
+    is_past_first_check = solver_state.num_iterations > termination_evaluation_frequency
+
+    sufficient_reduction = (
+        fixed_point_error
+        <= restart_params.sufficient_reduction_for_restart * initial_error
+    )
+    necessary_reduction = (
+        fixed_point_error
+        <= restart_params.necessary_reduction_for_restart * initial_error
+    )
+    error_increased = fixed_point_error > last_restart_info.last_trial_fixed_point_error
+    # solutions_count / num_iterations are the reference's inner_count /
+    # total_count: both count take_step calls, both reset at a restart.
+    artificial_restart = (
+        solver_state.solutions_count
+        >= restart_params.artificial_restart_threshold * solver_state.num_iterations
+    )
+
+    do_restart = is_first_check | (
+        is_past_first_check
+        & (
+            sufficient_reduction
+            | (necessary_reduction & error_increased)
+            | artificial_restart
+        )
+    )
+    return do_restart, fixed_point_error
 
 
 def restart_criteria_met_kkt(

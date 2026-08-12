@@ -419,6 +419,25 @@ class raPDHG(abc.ABC):
         step_size_limit = (1 + jnp.true_divide(1, iteration)) * last_step_size
         return jnp.minimum(next_step_size, step_size_limit)
 
+    def compute_constant_step_size_norms(self, scaled_qp, is_lp):
+        """Operator norms behind the non-adaptive step size.
+
+        Split out so r2HPDHG can substitute its own estimator without the
+        parent computing one that would then be thrown away.
+        """
+        if scaled_qp.constraint_matrix.shape[0] == 0:
+            self._norm_A = 0.0
+        else:
+            self._norm_A = estimate_maximum_singular_value(
+                scaled_qp.constraint_matrix
+            )[0]
+        if is_lp:
+            self._norm_Q = 0.0
+        else:
+            self._norm_Q = estimate_maximum_singular_value(
+                scaled_qp.objective_matrix
+            )[0]
+
     def initialize_solver_status(
         self,
         scaled_problem: ScaledQpProblem,
@@ -486,18 +505,7 @@ class raPDHG(abc.ABC):
             #     )
             # )
             # step_size = (1 - desired_relative_error) / maximum_singular_value
-            if scaled_qp.constraint_matrix.shape[0] == 0:
-                self._norm_A = 0.0
-            else:
-                self._norm_A = estimate_maximum_singular_value(
-                    scaled_qp.constraint_matrix
-                )[0]
-            if is_lp:
-                self._norm_Q = 0.0
-            else:
-                self._norm_Q = estimate_maximum_singular_value(
-                    scaled_qp.objective_matrix
-                )[0]
+            self.compute_constant_step_size_norms(scaled_qp, is_lp)
             step_size = 1.0  # Placeholder for step size.
 
         if self.warm_start:

@@ -300,6 +300,13 @@ class RestartInfo:
     primal_distance_moved_last_restart_period: float = 0.0
     dual_distance_moved_last_restart_period: float = 0.0
     reduction_ratio_last_trial: float = 1.0
+    # r2HPDHG only: cuPDLP-x measures restart progress against the
+    # fixed-point error re-probed just after the last restart, and against
+    # the error seen at the previous check. Zero-initialized on purpose --
+    # it makes both reduction tests false until the first (forced) restart,
+    # which is what the reference does.
+    initial_fixed_point_error: float = 0.0
+    last_trial_fixed_point_error: float = jnp.inf
 
 
 class RestartParameters(NamedTuple):
@@ -353,8 +360,13 @@ class ScaledQpProblem(NamedTuple):
 
     original_qp: QuadraticProgrammingProblem
     scaled_qp: QuadraticProgrammingProblem
+    # constraint_bound_rescaling / objective_vector_rescaling are the two
+    # scalar factors applied by bound_objective_rescaling (r2HPDHG only).
+    # They stay 1.0 when that pass is off, so raPDHG is unaffected.
     constraint_rescaling: jnp.ndarray
     variable_rescaling: jnp.ndarray
+    constraint_bound_rescaling: float = 1.0
+    objective_vector_rescaling: float = 1.0
 
 
 class RestartChoice(IntEnum):
@@ -628,6 +640,12 @@ class PdhgSolverState:
     delta_dual: Optional[jnp.ndarray] = None
     delta_primal_product: Optional[jnp.ndarray] = None
     initial_step_size: float = 0.0
+    # r2HPDHG only: cuPDLP-x measures convergence at the pure PDHG iterate
+    # rather than the Halpern average, and needs the bound multiplier that
+    # the primal projection implies. current_* stays the Halpern iterate.
+    pdhg_primal_solution: Optional[jnp.ndarray] = None
+    pdhg_dual_solution: Optional[jnp.ndarray] = None
+    dual_slack: Optional[jnp.ndarray] = None
 
 
 class TimingData(dict):

@@ -270,6 +270,7 @@ def rescale_problem(
     l2_norm_rescaling_flag: bool,
     pock_chambolle_alpha: Union[float, None],
     original_problem: QuadraticProgrammingProblem,
+    bound_objective_rescaling: bool = False,
 ) -> ScaledQpProblem:
     """
     Preprocesses and rescales the original problem, returning a ScaledQpProblem struct.
@@ -348,11 +349,43 @@ def rescale_problem(
     # directions on 4/5 instances (see benchmarks/results/2026-08-10-matvec.txt),
     # so the constraint matrices stay BCOO end-to-end instead of converting
     # back to BCSR here.
+    # cuPDLP-x's final scalar pass, applied after Ruiz/Pock-Chambolle: divide
+    # the bounds and the objective through by their own norms so both land at
+    # order 1. Equality rows are excluded from the bound norm (their lower and
+    # upper bound would otherwise be counted twice).
+    constraint_bound_rescaling = 1.0
+    objective_vector_rescaling = 1.0
+    if bound_objective_rescaling:
+        lower_masked = jnp.where(
+            jnp.isfinite(problem.constraint_lower_bound)
+            & (problem.constraint_lower_bound != problem.constraint_upper_bound),
+            problem.constraint_lower_bound,
+            0.0,
+        )
+        upper_masked = jnp.where(
+            jnp.isfinite(problem.constraint_upper_bound),
+            problem.constraint_upper_bound,
+            0.0,
+        )
+        constraint_bound_rescaling = 1 / (
+            jnp.linalg.norm(jnp.concatenate([lower_masked, upper_masked]), ord=2) + 1
+        )
+        objective_vector_rescaling = 1 / (
+            jnp.linalg.norm(problem.objective_vector, ord=2) + 1
+        )
+        problem.variable_lower_bound *= constraint_bound_rescaling
+        problem.variable_upper_bound *= constraint_bound_rescaling
+        problem.constraint_lower_bound *= constraint_bound_rescaling
+        problem.constraint_upper_bound *= constraint_bound_rescaling
+        problem.objective_vector *= objective_vector_rescaling
+
     scaled_problem = ScaledQpProblem(
         original_qp=original_problem,
         scaled_qp=problem,
         constraint_rescaling=constraint_rescaling,
         variable_rescaling=variable_rescaling,
+        constraint_bound_rescaling=constraint_bound_rescaling,
+        objective_vector_rescaling=objective_vector_rescaling,
     )
 
     return scaled_problem

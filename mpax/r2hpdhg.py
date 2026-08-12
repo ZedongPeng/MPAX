@@ -1,16 +1,25 @@
 import logging
 import timeit
 from dataclasses import dataclass
+from typing import Tuple
 
+import jax
 import jax.numpy as jnp
 from jax.lax import cond
 
 from mpax.loop_utils import while_loop
 from mpax.preprocess import rescale_problem
-from mpax.rapdhg import compute_next_solution, line_search, raPDHG
+from mpax.rapdhg import (
+    compute_next_solution,
+    estimate_maximum_singular_value,
+    line_search,
+    raPDHG,
+)
 from mpax.restart import (
+    compute_cupdlpx_fixed_point_error,
     compute_new_primal_weight,
     restart_criteria_met_fixed_point,
+    should_do_adaptive_restart_cupdlpx,
     unscaled_saddle_point_output,
     weighted_norm,
 )
@@ -22,6 +31,7 @@ from mpax.solver_log import (
 from mpax.termination import (
     cached_quadratic_program_info,
     check_termination_criteria,
+    check_termination_criteria_cupdlpx,
     check_primal_feasibility,
     check_dual_feasibility,
     optimality_criteria_met,
@@ -33,6 +43,7 @@ from mpax.utils import (
     RestartScheme,
     RestartToCurrentMetric,
     SaddlePointOutput,
+    ScaledQpProblem,
     SolveConfig,
     TerminationStatus,
     ConvergenceInformation,
@@ -49,6 +60,40 @@ from mpax.iteration_stats_utils import compute_convergence_information
 logger = logging.getLogger(__name__)
 
 
+def power_method_sigma_max(matrix, matrix_t, tolerance=1e-4, max_iterations=400):
+    """sigma_max of A by power iteration on A A', stopped on the eigenpair residual.
+
+    The shared `estimate_maximum_singular_value` stops on a probabilistic
+    bound and spends ~300 iterations whatever the instance. This stops as
+    soon as the eigenpair has settled -- 15 iterations on some problems --
+    and caps the ill-separated ones, where the reference's uncapped residual
+    test can run thousands of iterations for accuracy the 0.998 step-size
+    factor does not need. At the cap the estimate is within 0.06% on the
+    benchmark set, comfortably inside that 0.2% margin.
+
+    Power iteration approaches sigma_max from below, so the result is always
+    an under-estimate; the cap must stay tight enough that it does not eat
+    the margin.
+    """
+    z0 = jax.random.normal(jax.random.PRNGKey(1), (matrix.shape[0],)) + 1e-8
+
+    def cond_fun(state):
+        i, _, _, residual = state
+        return (i < max_iterations) & (residual >= tolerance)
+
+    def body_fun(state):
+        i, z, _, _ = state
+        q = z / jnp.linalg.norm(z)
+        z_new = matrix @ (matrix_t @ q)
+        eigenvalue = jnp.dot(q, z_new)
+        return i + 1, z_new, eigenvalue, jnp.linalg.norm(z_new - eigenvalue * q)
+
+    _, _, eigenvalue, _ = jax.lax.while_loop(
+        cond_fun, body_fun, (0, z0, jnp.array(1.0), jnp.array(tolerance))
+    )
+    return jnp.sqrt(eigenvalue)
+
+
 @dataclass(eq=False)
 class r2HPDHG(raPDHG):
     """
@@ -61,7 +106,9 @@ class r2HPDHG(raPDHG):
     jit: bool = True
     unroll: bool = False
     termination_evaluation_frequency: int = 100
-    optimality_norm: float = jnp.inf
+    # cuPDLP-x measures residuals in the 2-norm; the inf-norm default this
+    # replaced made r2HPDHG stop at a different point for the same tolerance.
+    optimality_norm: float = 2
     eps_abs: float = 1e-4
     eps_rel: float = 1e-4
     eps_primal_infeasible: float = 1e-8
@@ -88,6 +135,9 @@ class r2HPDHG(raPDHG):
     feasibility_polishing: bool = False
     eps_feas_polish: float = 1e-06
     infeasibility_detection: bool = True
+    # cuPDLP-x's post-Ruiz scalar pass on bounds and objective. It also fixes
+    # the initial primal weight at 1.0, since both sides are order 1 after it.
+    bound_objective_rescaling: bool = False
 
     def resolve_config(self, is_lp: bool) -> SolveConfig:
         if not is_lp:
@@ -96,6 +146,130 @@ class r2HPDHG(raPDHG):
                 "zero); use raPDHG for QP."
             )
         return super().resolve_config(is_lp)
+
+    def initialize_solver_status(
+        self,
+        scaled_problem: ScaledQpProblem,
+        initial_primal_solution: jnp.array,
+        initial_dual_solution: jnp.array,
+        is_lp: bool,
+        cfg: SolveConfig,
+    ) -> Tuple[PdhgSolverState, RestartInfo, float]:
+        """Wire the constant step size to 0.998 / sigma_max(scaled A).
+
+        raPDHG leaves step_size at a placeholder 1.0 on the non-adaptive
+        path because its own take_step recomputes the step size every
+        iteration via calculate_constant_step_size. r2HPDHG overrides
+        take_step and reuses solver_state.step_size verbatim, so without
+        this the constant-step-size path runs at 1.0 forever and the
+        sigma_max the parent computed is dead.
+        """
+        solver_state, last_restart_info, initial_primal_weight = (
+            super().initialize_solver_status(
+                scaled_problem,
+                initial_primal_solution,
+                initial_dual_solution,
+                is_lp,
+                cfg,
+            )
+        )
+        if not cfg.adaptive_step_size:
+            # _norm_A comes from this class's compute_constant_step_size_norms
+            # override. It matters that that estimate is tight: power
+            # iteration approaches sigma_max from below, 0.998 leaves only
+            # 0.2% of margin, and the parent's 10%-relative-error default
+            # under-estimated qnet1_o by 1.24%, putting step*sigma_max at
+            # 1.010 -- past the stability threshold, and the run diverged.
+            # The m = 0 test is on a static shape, so it stays a Python
+            # branch; _norm_A itself is a tracer under jit and must not be.
+            if scaled_problem.scaled_qp.constraint_matrix.shape[0] == 0:
+                step_size = 1.0
+            else:
+                step_size = 0.998 / self._norm_A
+            # Seed initial_step_size too, so take_step's Halpern weight needs
+            # no per-iteration guard against the 0 sentinel.
+            solver_state = solver_state.replace(
+                step_size=step_size, initial_step_size=step_size
+            )
+        # These stay None on the shared state class (raPDHG never sets them),
+        # but the scan carry needs a concrete shape from the first iteration.
+        solver_state = solver_state.replace(
+            pdhg_primal_solution=solver_state.current_primal_solution,
+            pdhg_dual_solution=solver_state.current_dual_solution,
+            dual_slack=jnp.zeros_like(solver_state.current_primal_solution),
+        )
+        if self.bound_objective_rescaling:
+            # Bounds and objective are both order 1 after that pass, so the
+            # reference starts the weight at 1 rather than at ||c||/||b||.
+            solver_state = solver_state.replace(primal_weight=1.0)
+            initial_primal_weight = 1.0
+        return solver_state, last_restart_info, initial_primal_weight
+
+    def compute_constant_step_size_norms(self, scaled_qp, is_lp):
+        """Residual-stopped power iteration in place of the parent's estimator.
+
+        Also avoids the parent's `BCSR.from_bcoo(matrix.T)` conversion: the
+        scaled problem already carries the transpose, so the operator can be
+        applied straight out of the existing BCOO pair.
+        """
+        self._norm_Q = 0.0
+        if scaled_qp.constraint_matrix.shape[0] == 0:
+            self._norm_A = 0.0
+        else:
+            self._norm_A = power_method_sigma_max(
+                scaled_qp.constraint_matrix, scaled_qp.constraint_matrix_t
+            )
+
+    @staticmethod
+    def _lp_reflected_step(problem, solver_state, step_size):
+        """One reflected PDHG step, specialized for LP.
+
+        Same arithmetic as `compute_next_solution` with extrapolation 1.0,
+        fused with the bookkeeping that used to follow it. Three redundant
+        passes go away: the projected primal already *is* the pure PDHG
+        iterate, `dual_slack` falls out of that same projection instead of
+        re-forming c - A'y, and the Qx momentum terms (identically zero for
+        an LP, since resolve_config rejects QP input) are dropped rather
+        than multiplied by zero on every iteration.
+        """
+        primal_step = step_size / solver_state.primal_weight
+        dual_step = step_size * solver_state.primal_weight
+
+        gradient = problem.objective_vector - solver_state.current_dual_product
+        unprojected = solver_state.current_primal_solution - primal_step * gradient
+        pdhg_primal = jnp.clip(
+            unprojected, problem.variable_lower_bound, problem.variable_upper_bound
+        )
+        # (proj(x~) - x~) / primal_step: the bound multiplier the projection
+        # implies, needed by the cuPDLP-x dual residual.
+        dual_slack = (pdhg_primal - unprojected) / primal_step
+        delta_primal = pdhg_primal - solver_state.current_primal_solution
+        delta_primal_product = problem.constraint_matrix @ delta_primal
+        # A @ (x + 2 dx), i.e. the product of the reflected primal. The dual
+        # update and the Halpern average of the product both need it, and
+        # they sit in different scopes, so form it once here.
+        reflected_primal_product = (
+            solver_state.current_primal_product + 2 * delta_primal_product
+        )
+
+        candidate = (
+            solver_state.current_dual_solution - dual_step * reflected_primal_product
+        )
+        pdhg_dual = candidate - jnp.clip(
+            candidate,
+            -dual_step * problem.constraint_upper_bound,
+            -dual_step * problem.constraint_lower_bound,
+        )
+        delta_dual = pdhg_dual - solver_state.current_dual_solution
+        return (
+            delta_primal,
+            delta_primal_product,
+            reflected_primal_product,
+            delta_dual,
+            pdhg_primal,
+            pdhg_dual,
+            dual_slack,
+        )
 
     def take_step(
         self,
@@ -130,28 +304,59 @@ class r2HPDHG(raPDHG):
                 self.adaptive_step_size_limit_coef,
             )
         else:
-            delta_primal, delta_primal_product, delta_dual = compute_next_solution(
-                problem, solver_state, solver_state.step_size, 1.0
-            )
+            # The pure PDHG iterate (before Halpern averaging) and the
+            # projection's bound multiplier come out of the fused step;
+            # cuPDLP-x terminates on that iterate, not on the Halpern
+            # average. Both of its products are left to the termination
+            # check, which runs 200x less often than the step does.
+            (
+                delta_primal,
+                delta_primal_product,
+                reflected_primal_product,
+                delta_dual,
+                pdhg_primal_solution,
+                pdhg_dual_solution,
+                dual_slack,
+            ) = self._lp_reflected_step(problem, solver_state, solver_state.step_size)
             step_size = solver_state.step_size
             line_search_iter = 1
+
+        if cfg.adaptive_step_size:
+            # line_search returns only the deltas, so the quantities the fused
+            # step hands back directly have to be reconstructed here.
+            reflected_primal_product = (
+                solver_state.current_primal_product + 2 * delta_primal_product
+            )
+            pdhg_primal_solution = solver_state.current_primal_solution + delta_primal
+            pdhg_dual_solution = solver_state.current_dual_solution + delta_dual
+            # x~ = x - (eta/w) g with g = c - A'y, so (proj(x~) - x~)/(eta/w)
+            # reduces to g + delta_primal * w / eta.
+            dual_slack = (
+                problem.objective_vector - solver_state.current_dual_product
+            ) + delta_primal * solver_state.primal_weight / step_size
 
         # Compute the weight according to the stepsize.
         new_solutions_count = solver_state.solutions_count + 1
         new_weights_sum = solver_state.weights_sum + solver_state.step_size
-        initial_step_size = cond(
-            solver_state.initial_step_size == 0,
-            lambda _: step_size,
-            lambda _: solver_state.initial_step_size,
-            operand=None,
-        )
+        if cfg.adaptive_step_size:
+            initial_step_size = cond(
+                solver_state.initial_step_size == 0,
+                lambda _: step_size,
+                lambda _: solver_state.initial_step_size,
+                operand=None,
+            )
+        else:
+            # Both initialize_solver_status and perform_restart seed this, and
+            # the step size never changes, so the guard can never fire -- and
+            # a lax.cond on every iteration is not free at this problem size.
+            initial_step_size = solver_state.initial_step_size
         weight = (new_weights_sum) / (new_weights_sum + initial_step_size)
         next_primal_solution = (
             weight * (solver_state.current_primal_solution + 2 * delta_primal)
             + (1 - weight) * solver_state.initial_primal_solution
         )
         next_primal_product = (
-            weight * (solver_state.current_primal_product + 2 * delta_primal_product)
+            weight * reflected_primal_product
             + (1 - weight) * solver_state.initial_primal_product
         )
         next_dual_solution = (
@@ -165,18 +370,22 @@ class r2HPDHG(raPDHG):
             current_dual_solution=next_dual_solution,
             current_primal_product=next_primal_product,
             current_dual_product=next_dual_product,
-            # Zero by construction: r2HPDHG is LP-only (enforced in
-            # resolve_config), so Qx == 0 for every iterate.
-            current_primal_obj_product=jnp.zeros_like(next_primal_solution),
+            # Qx == 0 for every iterate (r2HPDHG is LP-only, enforced in
+            # resolve_config) and the avg_* fields belong to raPDHG's
+            # averaging, which this solver never reads. Carrying the arrays
+            # through costs nothing; rebuilding them with zeros_like cost six
+            # allocations and six kernel launches on every single iteration,
+            # which dominated the step on small problems.
+            current_primal_obj_product=solver_state.current_primal_obj_product,
             initial_primal_solution=solver_state.initial_primal_solution,
             initial_dual_solution=solver_state.initial_dual_solution,
             initial_primal_product=solver_state.initial_primal_product,
             initial_dual_product=solver_state.initial_dual_product,
-            avg_primal_solution=jnp.zeros_like(next_primal_solution),
-            avg_dual_solution=jnp.zeros_like(next_dual_solution),
-            avg_primal_product=jnp.zeros_like(next_primal_product),
-            avg_dual_product=jnp.zeros_like(next_dual_product),
-            avg_primal_obj_product=jnp.zeros_like(next_primal_solution),
+            avg_primal_solution=solver_state.avg_primal_solution,
+            avg_dual_solution=solver_state.avg_dual_solution,
+            avg_primal_product=solver_state.avg_primal_product,
+            avg_dual_product=solver_state.avg_dual_product,
+            avg_primal_obj_product=solver_state.avg_primal_obj_product,
             solutions_count=new_solutions_count,
             weights_sum=new_weights_sum,
             step_size=step_size,
@@ -188,6 +397,9 @@ class r2HPDHG(raPDHG):
             delta_primal=delta_primal,
             delta_dual=delta_dual,
             delta_primal_product=delta_primal_product,
+            pdhg_primal_solution=pdhg_primal_solution,
+            pdhg_dual_solution=pdhg_dual_solution,
+            dual_slack=dual_slack,
             initial_step_size=initial_step_size,
         )
 
@@ -216,8 +428,11 @@ class r2HPDHG(raPDHG):
             - weight * solver_state.initial_primal_product
             - solver_state.delta_primal_product
         )
+        # A' y at the reconstructed point -- the other three products above are
+        # all taken at last_iteration_*, so taking this one at the Halpern
+        # iterate instead left the restarted state internally inconsistent.
         last_iteration_dual_product = (
-            problem.constraint_matrix_t @ solver_state.current_dual_solution
+            problem.constraint_matrix_t @ last_iteration_dual_solution
         )
         last_iteration_solver_state = PdhgSolverState(
             current_primal_solution=last_iteration_primal_solution,
@@ -240,17 +455,35 @@ class r2HPDHG(raPDHG):
             primal_weight=solver_state.primal_weight,
             numerical_error=False,
             num_steps_tried=solver_state.num_steps_tried,
-            num_iterations=solver_state.num_iterations - 1,
+            num_iterations=solver_state.num_iterations,
             termination_status=TerminationStatus.UNSPECIFIED,
+            # Restarting anchors current at the pure PDHG point, so the
+            # pdhg_* view coincides with it here.
+            pdhg_primal_solution=last_iteration_primal_solution,
+            pdhg_dual_solution=last_iteration_dual_solution,
+            dual_slack=solver_state.dual_slack,
         )
-        restarted_solver_state = self.take_step(
-            last_iteration_solver_state, problem, cfg
-        )
+        # cuPDLP-x restarts *at* the pure-PDHG point: current and initial both
+        # become that anchor and no step is taken. Advancing one step here
+        # while resetting the counters to zero (as this did) put every restart
+        # period one step out of phase with the reference.
+        restarted_solver_state = last_iteration_solver_state
         restarted_solver_state.initial_step_size = restarted_solver_state.step_size
         restarted_solver_state.initial_primal_solution = last_iteration_primal_solution
         restarted_solver_state.initial_dual_solution = last_iteration_dual_solution
         restarted_solver_state.initial_primal_product = last_iteration_primal_product
         restarted_solver_state.initial_dual_product = last_iteration_dual_product
+
+        # The reference probes one PDHG step at the anchor to seed its restart
+        # baseline, without advancing the iterate.
+        probe_delta_primal, probe_delta_primal_product, probe_delta_dual = (
+            compute_next_solution(
+                problem, restarted_solver_state, restarted_solver_state.step_size, 1.0
+            )
+        )
+        restarted_solver_state.delta_primal = probe_delta_primal
+        restarted_solver_state.delta_dual = probe_delta_dual
+        restarted_solver_state.delta_primal_product = probe_delta_primal_product
 
         primal_norm_params = (
             1 / restarted_solver_state.step_size * restarted_solver_state.primal_weight
@@ -291,6 +524,20 @@ class r2HPDHG(raPDHG):
         restarted_solver_state.solutions_count = 0
         restarted_solver_state.weights_sum = 0.0
 
+        # cuPDLP-x re-probes the fixed-point error at the restarted point,
+        # after the new primal weight is in place. The take_step above
+        # already produced exactly the deltas that probe needs, so this
+        # costs no extra step.
+        new_last_restart_info.initial_fixed_point_error = (
+            compute_cupdlpx_fixed_point_error(
+                restarted_solver_state.delta_primal,
+                restarted_solver_state.delta_dual,
+                restarted_solver_state.delta_primal_product,
+                restarted_solver_state.step_size,
+                restarted_solver_state.primal_weight,
+            )
+        )
+        new_last_restart_info.last_trial_fixed_point_error = jnp.inf
         return restarted_solver_state, new_last_restart_info
 
     def run_restart_scheme(
@@ -319,19 +566,26 @@ class r2HPDHG(raPDHG):
         tuple
             The new solver state, and the new last restart info.
         """
-        do_restart, kkt_reduction_ratio = cond(
-            solver_state.solutions_count == 0,
-            lambda: (False, last_restart_info.reduction_ratio_last_trial),
-            lambda: restart_criteria_met_fixed_point(
-                cfg.restart_params, solver_state, last_restart_info
-            ),
+        do_restart, fixed_point_error = should_do_adaptive_restart_cupdlpx(
+            cfg.restart_params,
+            solver_state,
+            last_restart_info,
+            self.termination_evaluation_frequency,
         )
+        # A restart clears the trial error (the reference resets it to inf, so
+        # `error_increased` cannot fire on the first check of a new restart
+        # period); otherwise the check records what it just measured.
         return cond(
             do_restart,
             lambda: self.perform_restart(
-                solver_state, last_restart_info, kkt_reduction_ratio, problem, cfg
+                solver_state, last_restart_info, fixed_point_error, problem, cfg
             ),
-            lambda: (solver_state, last_restart_info),
+            lambda: (
+                solver_state,
+                last_restart_info.replace(
+                    last_trial_fixed_point_error=fixed_point_error
+                ),
+            ),
         )
 
     def run_restart_scheme_feasibility_polishing(
@@ -438,28 +692,30 @@ class r2HPDHG(raPDHG):
         qp_cache,
         ci,
     ):
-        # Check for termination
+        # cuPDLP-x ordering: advance a full evaluation window first, then
+        # test termination and restart on the iterate that window produced.
+        # (Previously the restart test ran on the previous window's iterate,
+        # before any step had been taken.)
+        stepped_solver_state = self.take_multiple_steps(
+            solver_state, scaled_problem.scaled_qp, cfg
+        )
+
         should_terminate, termination_status, convergence_information = (
-            check_termination_criteria(
+            check_termination_criteria_cupdlpx(
                 scaled_problem,
-                solver_state,
+                stepped_solver_state,
                 cfg.termination_criteria,
                 qp_cache,
-                solver_state.numerical_error,
-                1.0,
+                stepped_solver_state.numerical_error,
                 self.optimality_norm,
-                average=False,
-                infeasibility_detection=cfg.infeasibility_detection,
+                cfg.infeasibility_detection,
             )
         )
 
-        restarted_solver_state, new_last_restart_info = self.run_restart_scheme(
-            scaled_problem.scaled_qp, solver_state, last_restart_info, cfg
+        new_solver_state, new_last_restart_info = self.run_restart_scheme(
+            scaled_problem.scaled_qp, stepped_solver_state, last_restart_info, cfg
         )
 
-        new_solver_state = self.take_multiple_steps(
-            restarted_solver_state, scaled_problem.scaled_qp, cfg
-        )
         new_solver_state.termination_status = termination_status
         return (
             new_solver_state,
@@ -687,6 +943,7 @@ class r2HPDHG(raPDHG):
             self.l2_norm_rescaling,
             self.pock_chambolle_alpha,
             original_problem,
+            self.bound_objective_rescaling,
         )
         precondition_time = timeit.default_timer() - precondition_start_time
         logger.info("Preconditioning Time (seconds): %.2e", precondition_time)
@@ -705,15 +962,11 @@ class r2HPDHG(raPDHG):
         display_iteration_stats_heading()
 
         iteration_start_time = timeit.default_timer()
-        (solver_state, last_restart_info, should_terminate, _, _) = while_loop(
-            cond_fun=lambda state: state[2] == False,
-            body_fun=lambda state: self.initial_iteration_update(cfg, *state),
-            init_val=(solver_state, last_restart_info, False, scaled_problem, qp_cache),
-            maxiter=10,
-            unroll=self.unroll,
-            jit=self.jit,
-        )
-
+        # No warm-up phase: cuPDLP-x goes straight into full evaluation
+        # windows, so its first restart check lands at exactly
+        # termination_evaluation_frequency iterations. The 10 single-step
+        # iterations that used to run here shifted every later check by 10
+        # and made iteration counts incomparable with the reference.
         (solver_state, last_restart_info, should_terminate, _, _, ci) = while_loop(
             cond_fun=lambda state: state[2] == False,
             body_fun=lambda state: self.main_iteration_update(cfg, *state),
@@ -819,10 +1072,17 @@ class r2HPDHG(raPDHG):
         )
         return unscaled_saddle_point_output(
             scaled_problem,
-            solver_state.current_primal_solution,
-            solver_state.current_dual_solution,
+            # The reference reports the pure PDHG iterate, which is also the
+            # point its residuals were measured at; returning the Halpern
+            # average would hand back a point with different residuals than
+            # the ones that satisfied the tolerance.
+            solver_state.pdhg_primal_solution,
+            solver_state.pdhg_dual_solution,
             solver_state.termination_status,
-            solver_state.num_iterations - 1,
+            # The -1 here compensated for the warm-up loop that used to run
+            # before the main loop; without it the count is exactly the
+            # reference's total_count.
+            solver_state.num_iterations,
             ci,
             timing,
         )

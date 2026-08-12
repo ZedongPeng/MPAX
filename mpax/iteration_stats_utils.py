@@ -297,6 +297,115 @@ def compute_convergence_information(
     )
 
 
+def compute_cupdlpx_convergence_information(
+    scaled_problem,
+    qp_cache: CachedQuadraticProgramInfo,
+    solver_state,
+    norm_ord: float = 2,
+) -> ConvergenceInformation:
+    """cuPDLP-x's convergence measures, for the r2HPDHG LP path.
+
+    Four things differ from `compute_convergence_information`, and each one
+    moves the point at which the solver stops:
+
+    * evaluated at the pure PDHG iterate, not the Halpern average;
+    * the dual residual is `c - A'y - dual_slack`, using the bound
+      multiplier the primal projection implies, rather than a reduced-cost
+      violation reconstructed from the gradient;
+    * the relative denominators are static (norms of the original data)
+      instead of growing with ||Ax|| and ||A'y||;
+    * the gap denominator is `1 + |p| + |d|`, not `1 + max(|p|, |d|)`.
+    """
+    problem = scaled_problem.scaled_qp
+    primal_iterate = solver_state.pdhg_primal_solution
+    dual_iterate = solver_state.pdhg_dual_solution
+    # Both products are formed here rather than carried: this runs once per
+    # evaluation window, so two matvecs are cheaper than maintaining them on
+    # every one of the ~200 steps in between.
+    primal_product = problem.constraint_matrix @ primal_iterate
+    dual_product = problem.constraint_matrix_t @ dual_iterate
+    dual_slack = solver_state.dual_slack
+
+    # Undo the Ruiz/Pock-Chambolle scaling before measuring, as the
+    # reference does; the objective pairing is scale-invariant already.
+    primal_residual = (
+        primal_product
+        - jnp.clip(
+            primal_product,
+            problem.constraint_lower_bound,
+            problem.constraint_upper_bound,
+        )
+    ) * scaled_problem.constraint_rescaling
+    primal_residual_norm = (
+        jnp.linalg.norm(primal_residual, ord=norm_ord)
+        / scaled_problem.constraint_bound_rescaling
+    )
+
+    dual_residual = (
+        problem.objective_vector - dual_product - dual_slack
+    ) * scaled_problem.variable_rescaling
+    dual_residual_norm = (
+        jnp.linalg.norm(dual_residual, ord=norm_ord)
+        / scaled_problem.objective_vector_rescaling
+    )
+
+    lower_finite = jnp.where(
+        jnp.isfinite(problem.constraint_lower_bound),
+        problem.constraint_lower_bound,
+        0.0,
+    )
+    upper_finite = jnp.where(
+        jnp.isfinite(problem.constraint_upper_bound),
+        problem.constraint_upper_bound,
+        0.0,
+    )
+
+    objective_unscale = (
+        scaled_problem.constraint_bound_rescaling
+        * scaled_problem.objective_vector_rescaling
+    )
+    primal_objective = (
+        jnp.dot(problem.objective_vector, primal_iterate) / objective_unscale
+        + problem.objective_constant
+    )
+    dual_objective = (
+        jnp.sum(
+            jnp.maximum(dual_iterate, 0.0) * lower_finite
+            + jnp.minimum(dual_iterate, 0.0) * upper_finite
+        )
+        + jnp.dot(primal_iterate, dual_slack)
+    ) / objective_unscale + problem.objective_constant
+
+    relative_primal_residual_norm = primal_residual_norm / (
+        1 + qp_cache.constraint_bound_norm
+    )
+    relative_dual_residual_norm = dual_residual_norm / (
+        1 + qp_cache.primal_linear_objective_norm
+    )
+    absolute_optimality_gap = jnp.abs(primal_objective - dual_objective)
+    relative_optimality_gap = absolute_optimality_gap / (
+        1 + jnp.abs(primal_objective) + jnp.abs(dual_objective)
+    )
+    corrected_dual_obj_value = jax.lax.cond(
+        dual_residual_norm == 0.0, lambda: dual_objective, lambda: -jnp.inf
+    )
+
+    return ConvergenceInformation(
+        PointType.POINT_TYPE_CURRENT_ITERATE,
+        primal_objective,
+        dual_objective,
+        corrected_dual_obj_value,
+        primal_residual_norm,
+        dual_residual_norm,
+        relative_primal_residual_norm,
+        relative_dual_residual_norm,
+        absolute_optimality_gap,
+        relative_optimality_gap,
+        jnp.linalg.norm(primal_iterate, ord=norm_ord),
+        safe_norm(dual_iterate, ord=norm_ord),
+    )
+
+
 def compute_infeasibility_information(
     problem: QuadraticProgrammingProblem,
     primal_ray_estimate: jnp.ndarray,
