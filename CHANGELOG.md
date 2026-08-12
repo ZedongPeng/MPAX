@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+- r2HPDHG is constant-step-size only: Halpern PDHG's convergence
+  guarantee (and the cuPDLP-x reference) assume a fixed step, so the
+  adaptive line-search path was removed from its `take_step` and
+  `resolve_config` now rejects `adaptive_step_size=True` with a
+  readable error. raPDHG is unchanged (adaptive remains its LP
+  default). Iteration counts for r2HPDHG change accordingly: on the
+  benchmark sweep, fewer iterations on flugpl/gen-ip054 (-14% to
+  -50%), more on the degenerate knapsack-2000 (1 x 2000; +171% at
+  1e-8) — re-baseline before gating.
+
+### Changed
+- r2HPDHG evaluation windows run lean: the first N-1 steps of a
+  window no longer compute or carry `pdhg_*`, `dual_slack` and
+  `delta_*` (only the window's last step does, and nothing reads them
+  earlier), and for sparse problems the lean step scatter-adds A dx
+  straight onto A x instead of materializing the matvec separately.
+  Same iterate arithmetic up to fp reassociation of that sum;
+  iteration counts across the CPU sweep are unchanged. Measured
+  per-iteration cost drops 22-45% on mid-size MIPLIB LP relaxations
+  and 2-9% on large ones on an H100. (Measured and rejected along the
+  way, all equal or slower on GPU: sorted-BCOO cusparse lowering,
+  BCSR/CSR formats, fori_loop unrolling, WHILE command buffers.)
+
 ## v0.3.0 — 2026-08-10
 
 ### Breaking

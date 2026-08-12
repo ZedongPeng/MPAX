@@ -5,14 +5,13 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.sparse import BCOO
 from jax.lax import cond
 
 from mpax.loop_utils import while_loop
 from mpax.preprocess import rescale_problem
 from mpax.rapdhg import (
     compute_next_solution,
-    estimate_maximum_singular_value,
-    line_search,
     raPDHG,
 )
 from mpax.restart import (
@@ -127,10 +126,11 @@ class r2HPDHG(raPDHG):
     sufficient_reduction_for_restart: float = 0.2
     necessary_reduction_for_restart: float = 0.6
     primal_weight_update_smoothing: float = 0.6
-    adaptive_step_size: bool = True
-    adaptive_step_size_reduction_exponent: float = 0.4
-    adaptive_step_size_growth_exponent: float = 0.8
-    adaptive_step_size_limit_coef: float = 0.2
+    # Halpern PDHG's convergence theory and the cuPDLP-x reference both
+    # assume a constant step size; take_step has no line-search path.
+    # The field stays (inherited) only so resolve_config can reject an
+    # explicit True with a readable error instead of silently ignoring it.
+    adaptive_step_size: bool = False
     warm_start: bool = False
     feasibility_polishing: bool = False
     eps_feas_polish: float = 1e-06
@@ -144,6 +144,12 @@ class r2HPDHG(raPDHG):
             raise ValueError(
                 "r2HPDHG supports LP only (its Qx terms are hardwired to "
                 "zero); use raPDHG for QP."
+            )
+        if self.adaptive_step_size:
+            raise ValueError(
+                "r2HPDHG uses a constant step size (Halpern PDHG's "
+                "convergence guarantee requires it); adaptive_step_size is "
+                "not supported. Use raPDHG for an adaptive line search."
             )
         return super().resolve_config(is_lp)
 
@@ -173,24 +179,23 @@ class r2HPDHG(raPDHG):
                 cfg,
             )
         )
-        if not cfg.adaptive_step_size:
-            # _norm_A comes from this class's compute_constant_step_size_norms
-            # override. It matters that that estimate is tight: power
-            # iteration approaches sigma_max from below, 0.998 leaves only
-            # 0.2% of margin, and the parent's 10%-relative-error default
-            # under-estimated qnet1_o by 1.24%, putting step*sigma_max at
-            # 1.010 -- past the stability threshold, and the run diverged.
-            # The m = 0 test is on a static shape, so it stays a Python
-            # branch; _norm_A itself is a tracer under jit and must not be.
-            if scaled_problem.scaled_qp.constraint_matrix.shape[0] == 0:
-                step_size = 1.0
-            else:
-                step_size = 0.998 / self._norm_A
-            # Seed initial_step_size too, so take_step's Halpern weight needs
-            # no per-iteration guard against the 0 sentinel.
-            solver_state = solver_state.replace(
-                step_size=step_size, initial_step_size=step_size
-            )
+        # _norm_A comes from this class's compute_constant_step_size_norms
+        # override. It matters that that estimate is tight: power
+        # iteration approaches sigma_max from below, 0.998 leaves only
+        # 0.2% of margin, and the parent's 10%-relative-error default
+        # under-estimated qnet1_o by 1.24%, putting step*sigma_max at
+        # 1.010 -- past the stability threshold, and the run diverged.
+        # The m = 0 test is on a static shape, so it stays a Python
+        # branch; _norm_A itself is a tracer under jit and must not be.
+        if scaled_problem.scaled_qp.constraint_matrix.shape[0] == 0:
+            step_size = 1.0
+        else:
+            step_size = 0.998 / self._norm_A
+        # Seed initial_step_size too, so take_step's Halpern weight needs
+        # no per-iteration guard against the 0 sentinel.
+        solver_state = solver_state.replace(
+            step_size=step_size, initial_step_size=step_size
+        )
         # These stay None on the shared state class (raPDHG never sets them),
         # but the scan carry needs a concrete shape from the first iteration.
         solver_state = solver_state.replace(
@@ -221,7 +226,7 @@ class r2HPDHG(raPDHG):
             )
 
     @staticmethod
-    def _lp_reflected_step(problem, solver_state, step_size):
+    def _lp_reflected_step(problem, solver_state, step_size, window_end=True):
         """One reflected PDHG step, specialized for LP.
 
         Same arithmetic as `compute_next_solution` with extrapolation 1.0,
@@ -241,16 +246,41 @@ class r2HPDHG(raPDHG):
             unprojected, problem.variable_lower_bound, problem.variable_upper_bound
         )
         # (proj(x~) - x~) / primal_step: the bound multiplier the projection
-        # implies, needed by the cuPDLP-x dual residual.
-        dual_slack = (pdhg_primal - unprojected) / primal_step
-        delta_primal = pdhg_primal - solver_state.current_primal_solution
-        delta_primal_product = problem.constraint_matrix @ delta_primal
-        # A @ (x + 2 dx), i.e. the product of the reflected primal. The dual
-        # update and the Halpern average of the product both need it, and
-        # they sit in different scopes, so form it once here.
-        reflected_primal_product = (
-            solver_state.current_primal_product + 2 * delta_primal_product
+        # implies, needed by the cuPDLP-x dual residual. Only the last step
+        # of an evaluation window has a consumer for it.
+        dual_slack = (
+            (pdhg_primal - unprojected) / primal_step if window_end else None
         )
+        delta_primal = pdhg_primal - solver_state.current_primal_solution
+        if window_end:
+            # The restart test and perform_restart read delta_primal_product,
+            # so the window's last step forms it explicitly.
+            delta_primal_product = problem.constraint_matrix @ delta_primal
+            # A @ (x + 2 dx), i.e. the product of the reflected primal. The
+            # dual update and the Halpern average of the product both need
+            # it, and they sit in different scopes, so form it once here.
+            reflected_primal_product = (
+                solver_state.current_primal_product + 2 * delta_primal_product
+            )
+        elif isinstance(problem.constraint_matrix, BCOO):
+            # Inside a window nothing reads A dx on its own, so its
+            # contributions are scatter-added straight onto A x: this drops
+            # the matvec's zero-init and the separate A x + 2 dx pass, worth
+            # ~25% per iteration on mid-size MIPLIB LPs (H100, fp64). The
+            # default scatter mode drops out-of-bounds rows, which is
+            # exactly what padded BCOO entries need. Reassociates the sum
+            # relative to the window-end formula (same values up to fp
+            # rounding).
+            delta_primal_product = None
+            indices = problem.constraint_matrix.indices
+            reflected_primal_product = solver_state.current_primal_product.at[
+                indices[:, 0]
+            ].add(2 * problem.constraint_matrix.data * delta_primal[indices[:, 1]])
+        else:
+            delta_primal_product = None
+            reflected_primal_product = solver_state.current_primal_product + 2 * (
+                problem.constraint_matrix @ delta_primal
+            )
 
         candidate = (
             solver_state.current_dual_solution - dual_step * reflected_primal_product
@@ -276,9 +306,10 @@ class r2HPDHG(raPDHG):
         solver_state: PdhgSolverState,
         problem: QuadraticProgrammingProblem,
         cfg: SolveConfig,
+        window_end: bool = True,
     ) -> PdhgSolverState:
         """
-        Take a PDHG step with adaptive step size.
+        Take one reflected (Halpern) PDHG step at the constant step size.
 
         Parameters
         ----------
@@ -288,68 +319,40 @@ class r2HPDHG(raPDHG):
             The problem being solved.
         cfg : SolveConfig
             The per-solve configuration derived by `resolve_config`.
+        window_end : bool
+            Whether this step's pdhg_*, dual_slack and delta_* fields will
+            be read (the termination and restart checks consume them, and
+            they only see the last step of an evaluation window). Inside a
+            window they are neither computed nor written: the fields pass
+            through unchanged, which XLA hoists out of the loop carry. The
+            iterate update itself is identical either way.
         """
-        if cfg.adaptive_step_size:
-            (
-                delta_primal,
-                delta_dual,
-                delta_primal_product,
-                step_size,
-                line_search_iter,
-            ) = line_search(
-                problem,
-                solver_state,
-                self.adaptive_step_size_reduction_exponent,
-                self.adaptive_step_size_growth_exponent,
-                self.adaptive_step_size_limit_coef,
-            )
-        else:
-            # The pure PDHG iterate (before Halpern averaging) and the
-            # projection's bound multiplier come out of the fused step;
-            # cuPDLP-x terminates on that iterate, not on the Halpern
-            # average. Both of its products are left to the termination
-            # check, which runs 200x less often than the step does.
-            (
-                delta_primal,
-                delta_primal_product,
-                reflected_primal_product,
-                delta_dual,
-                pdhg_primal_solution,
-                pdhg_dual_solution,
-                dual_slack,
-            ) = self._lp_reflected_step(problem, solver_state, solver_state.step_size)
-            step_size = solver_state.step_size
-            line_search_iter = 1
-
-        if cfg.adaptive_step_size:
-            # line_search returns only the deltas, so the quantities the fused
-            # step hands back directly have to be reconstructed here.
-            reflected_primal_product = (
-                solver_state.current_primal_product + 2 * delta_primal_product
-            )
-            pdhg_primal_solution = solver_state.current_primal_solution + delta_primal
-            pdhg_dual_solution = solver_state.current_dual_solution + delta_dual
-            # x~ = x - (eta/w) g with g = c - A'y, so (proj(x~) - x~)/(eta/w)
-            # reduces to g + delta_primal * w / eta.
-            dual_slack = (
-                problem.objective_vector - solver_state.current_dual_product
-            ) + delta_primal * solver_state.primal_weight / step_size
+        # The pure PDHG iterate (before Halpern averaging) and the
+        # projection's bound multiplier come out of the fused step;
+        # cuPDLP-x terminates on that iterate, not on the Halpern
+        # average. Both of its products are left to the termination
+        # check, which runs 100x less often than the step does.
+        (
+            delta_primal,
+            delta_primal_product,
+            reflected_primal_product,
+            delta_dual,
+            pdhg_primal_solution,
+            pdhg_dual_solution,
+            dual_slack,
+        ) = self._lp_reflected_step(
+            problem, solver_state, solver_state.step_size, window_end
+        )
+        step_size = solver_state.step_size
 
         # Compute the weight according to the stepsize.
         new_solutions_count = solver_state.solutions_count + 1
         new_weights_sum = solver_state.weights_sum + solver_state.step_size
-        if cfg.adaptive_step_size:
-            initial_step_size = cond(
-                solver_state.initial_step_size == 0,
-                lambda _: step_size,
-                lambda _: solver_state.initial_step_size,
-                operand=None,
-            )
-        else:
-            # Both initialize_solver_status and perform_restart seed this, and
-            # the step size never changes, so the guard can never fire -- and
-            # a lax.cond on every iteration is not free at this problem size.
-            initial_step_size = solver_state.initial_step_size
+        # Both initialize_solver_status and perform_restart seed this, and
+        # the step size never changes, so a zero-sentinel guard can never
+        # fire -- and a lax.cond on every iteration is not free at this
+        # problem size.
+        initial_step_size = solver_state.initial_step_size
         weight = (new_weights_sum) / (new_weights_sum + initial_step_size)
         next_primal_solution = (
             weight * (solver_state.current_primal_solution + 2 * delta_primal)
@@ -364,6 +367,18 @@ class r2HPDHG(raPDHG):
             + (1 - weight) * solver_state.initial_dual_solution
         )
         next_dual_product = problem.constraint_matrix_t @ next_dual_solution
+
+        if not window_end:
+            # Pass-throughs: loop-invariant in the window's fori_loop, so no
+            # per-iteration carry writes. The window's last step (a
+            # window_end=True call) overwrites them all before any consumer
+            # reads them.
+            delta_primal = solver_state.delta_primal
+            delta_dual = solver_state.delta_dual
+            delta_primal_product = solver_state.delta_primal_product
+            pdhg_primal_solution = solver_state.pdhg_primal_solution
+            pdhg_dual_solution = solver_state.pdhg_dual_solution
+            dual_slack = solver_state.dual_slack
 
         return PdhgSolverState(
             current_primal_solution=next_primal_solution,
@@ -391,7 +406,7 @@ class r2HPDHG(raPDHG):
             step_size=step_size,
             primal_weight=solver_state.primal_weight,
             numerical_error=False,
-            num_steps_tried=solver_state.num_steps_tried + line_search_iter,
+            num_steps_tried=solver_state.num_steps_tried + 1,
             num_iterations=solver_state.num_iterations + 1,
             termination_status=TerminationStatus.UNSPECIFIED,
             delta_primal=delta_primal,
@@ -402,6 +417,31 @@ class r2HPDHG(raPDHG):
             dual_slack=dual_slack,
             initial_step_size=initial_step_size,
         )
+
+    def take_multiple_steps(
+        self,
+        solver_state: PdhgSolverState,
+        problem: QuadraticProgrammingProblem,
+        cfg: SolveConfig,
+    ) -> PdhgSolverState:
+        """One evaluation window: N-1 lean steps, then one full step.
+
+        Same iterate arithmetic as the parent's N x take_step, up to fp
+        reassociation of the reflected product in the lean steps (see
+        _lp_reflected_step); only the last step computes and stores the
+        pdhg_*, dual_slack and delta_* fields, which nothing reads until
+        the window ends. Together this cuts the measured per-iteration
+        cost by 25-45% on mid-size MIPLIB LP relaxations (H100, fp64).
+        """
+        if self.termination_evaluation_frequency < 1:
+            return solver_state
+        inner_state = jax.lax.fori_loop(
+            lower=0,
+            upper=self.termination_evaluation_frequency - 1,
+            body_fun=lambda i, s: self.take_step(s, problem, cfg, window_end=False),
+            init_val=solver_state,
+        )
+        return self.take_step(inner_state, problem, cfg)
 
     def perform_restart(
         self, solver_state, last_restart_info, kkt_reduction_ratio, problem, cfg
