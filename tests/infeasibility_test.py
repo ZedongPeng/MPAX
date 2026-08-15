@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+import pytest
 from jax import config
 
 config.update("jax_enable_x64", True)
@@ -68,8 +69,14 @@ def test_rapdhg_detects_dual_infeasible():
     assert result.termination_status == TerminationStatus.DUAL_INFEASIBLE
 
 
-def test_r2hpdhg_detects_primal_infeasible():
-    # Pins the Task-1 structural fix: r2HPDHG now forwards
-    # infeasibility_detection to check_termination_criteria.
-    result = r2HPDHG(iteration_limit=_LIMIT).optimize(_conflicting_rows_lp())
-    assert result.termination_status == TerminationStatus.PRIMAL_INFEASIBLE
+def test_r2hpdhg_never_declares_infeasible():
+    # r2HPDHG matches cuPDLP-x, which computes no infeasibility
+    # certificates: an infeasible LP runs to the iteration limit instead
+    # of terminating PRIMAL_INFEASIBLE.
+    result = r2HPDHG(iteration_limit=1000).optimize(_conflicting_rows_lp())
+    assert result.termination_status == TerminationStatus.ITERATION_LIMIT
+
+
+def test_r2hpdhg_rejects_infeasibility_detection():
+    with pytest.raises(ValueError, match="infeasibility_detection"):
+        r2HPDHG(infeasibility_detection=True).optimize(_conflicting_rows_lp())

@@ -6,10 +6,11 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.sparse import BCSR, BCOO
+from jax.experimental import sparse as jsparse
+from jax.experimental.sparse import BCSR, BCOO, CSR
 
 from mpax.loop_utils import while_loop
-from mpax.preprocess import rescale_problem
+from mpax.preprocess import attach_csr_matrices, rescale_problem
 from mpax.restart import (
     run_restart_scheme,
     run_restart_scheme_feasibility_polishing,
@@ -54,25 +55,36 @@ from mpax.iteration_stats_utils import compute_convergence_information
 logger = logging.getLogger(__name__)
 
 
+def _spmv(matrix, v):
+    """matrix @ v, through cusparse for CSR operands."""
+    if isinstance(matrix, CSR):
+        return jsparse.csr_matvec(matrix, v)
+    return matrix @ v
+
+
 def estimate_maximum_singular_value(
     matrix,
     probability_of_failure: float = 0.01,
     desired_relative_error: float = 0.1,
     seed: int = 1,
+    matrix_transpose=None,
 ) -> tuple:
     """
     Estimate the maximum singular value of a sparse matrix using the power method.
 
     Parameters
     ----------
-    matrix : BCOO, BCSR or jnp.ndarray
-        The matrix (the solver passes BCOO since v0.3).
+    matrix : BCOO, BCSR, CSR or jnp.ndarray
+        The matrix (the solver passes BCOO since v0.3, or CSR when the
+        cusparse fast path is attached).
     probability_of_failure : float, optional
         The acceptable probability of failure.
     desired_relative_error : float, optional
         The desired relative error for the estimation.
     seed : int, optional
         The random seed for reproducibility.
+    matrix_transpose : optional
+        The transpose in a matvec-ready format; built here when omitted.
 
     Returns
     -------
@@ -82,12 +94,13 @@ def estimate_maximum_singular_value(
     epsilon = 1.0 - (1.0 - desired_relative_error) ** 2
     key = jax.random.PRNGKey(seed)
     x = jax.random.normal(key, (matrix.shape[1],))
-    if isinstance(matrix, BCSR):
-        matrix_transpose = BCSR.from_bcoo(matrix.to_bcoo().T)
-    elif isinstance(matrix, BCOO):
-        matrix_transpose = BCSR.from_bcoo(matrix.T)
-    elif isinstance(matrix, jnp.ndarray):
-        matrix_transpose = matrix.T
+    if matrix_transpose is None:
+        if isinstance(matrix, BCSR):
+            matrix_transpose = BCSR.from_bcoo(matrix.to_bcoo().T)
+        elif isinstance(matrix, BCOO):
+            matrix_transpose = BCSR.from_bcoo(matrix.T)
+        elif isinstance(matrix, jnp.ndarray):
+            matrix_transpose = matrix.T
     number_of_power_iterations = 0
 
     def cond_fun(state):
@@ -112,7 +125,7 @@ def estimate_maximum_singular_value(
     def body_fun(state):
         x, number_of_power_iterations = state
         x = x / jnp.linalg.norm(x, 2)
-        x = matrix_transpose @ (matrix @ x)
+        x = _spmv(matrix_transpose, _spmv(matrix, x))
         return x, number_of_power_iterations + 1
 
     # while_loop() compiles cond_fun and body_fun, so while it can be combined with jit(), it’s usually unnecessary.
@@ -126,7 +139,8 @@ def estimate_maximum_singular_value(
     )
     return (
         jnp.sqrt(
-            jnp.dot(x, matrix_transpose @ (matrix @ x)) / jnp.linalg.norm(x, 2) ** 2
+            jnp.dot(x, _spmv(matrix_transpose, _spmv(matrix, x)))
+            / jnp.linalg.norm(x, 2) ** 2
         ),
         number_of_power_iterations,
     )
@@ -173,7 +187,7 @@ def compute_next_solution(
         jnp.maximum(problem.variable_lower_bound, next_primal_solution),
     )
     delta_primal = next_primal_solution - solver_state.current_primal_solution
-    delta_primal_product = problem.constraint_matrix @ delta_primal
+    delta_primal_product = problem.matvec(delta_primal)
 
     # Compute the next dual solution via a single Moreau projection that
     # covers all four row classes (eq / >= / <= / free); see the design
@@ -337,6 +351,15 @@ class raPDHG(abc.ABC):
     feasibility_polishing: bool = False
     eps_feas_polish: float = 1e-06
     infeasibility_detection: bool = True
+    # Route matvecs (A, A', and Q for QPs) through cusparse CSR instead of
+    # XLA's native BCOO lowering. cusparse is the safe default: on
+    # heavy-row matrices the BCOO kernels collapse (BOYD1: 833us -> 75us
+    # per iteration; square41: 90x per SpMV), while the cost of cusparse
+    # on light instances is a bounded fixed overhead per call (its custom
+    # calls split XLA's command-buffer capture of the loop; QPLIB_10038:
+    # 52us -> 91us per iteration). Set False to stay on the fused XLA
+    # kernels when that overhead dominates.
+    use_cusparse: bool = True
 
     def resolve_config(self, is_lp: bool) -> SolveConfig:
         """Derive the per-solve configuration without mutating the solver.
@@ -451,12 +474,23 @@ class raPDHG(abc.ABC):
         """
         if scaled_qp.constraint_matrix.shape[0] == 0:
             self._norm_A = 0.0
+        elif scaled_qp.constraint_matrix_csr is not None:
+            self._norm_A = estimate_maximum_singular_value(
+                scaled_qp.constraint_matrix_csr,
+                matrix_transpose=scaled_qp.constraint_matrix_t_csr,
+            )[0]
         else:
             self._norm_A = estimate_maximum_singular_value(
                 scaled_qp.constraint_matrix
             )[0]
         if is_lp:
             self._norm_Q = 0.0
+        elif scaled_qp.objective_matrix_csr is not None:
+            # Q is symmetric: its CSR serves as its own transpose.
+            self._norm_Q = estimate_maximum_singular_value(
+                scaled_qp.objective_matrix_csr,
+                matrix_transpose=scaled_qp.objective_matrix_csr,
+            )[0]
         else:
             self._norm_Q = estimate_maximum_singular_value(
                 scaled_qp.objective_matrix
@@ -540,10 +574,10 @@ class raPDHG(abc.ABC):
                 initial_dual_solution * scaled_problem.constraint_rescaling
             )
             scaled_initial_primal_product = (
-                scaled_qp.constraint_matrix @ scaled_initial_primal_solution
+                scaled_qp.matvec(scaled_initial_primal_solution)
             )
             scaled_initial_dual_product = (
-                scaled_qp.constraint_matrix_t @ scaled_initial_dual_solution
+                scaled_qp.matvec_t(scaled_initial_dual_solution)
             )
             scaled_primal_obj_product = compute_objective_product(
                 scaled_qp, scaled_initial_primal_solution
@@ -652,7 +686,7 @@ class raPDHG(abc.ABC):
             problem, next_primal_solution
         )
         next_dual_solution = solver_state.current_dual_solution + delta_dual
-        next_dual_product = problem.constraint_matrix_t @ next_dual_solution
+        next_dual_product = problem.matvec_t(next_dual_solution)
 
         ratio = step_size / (solver_state.weights_sum + step_size)
         next_avg_primal_solution = solver_state.avg_primal_solution + ratio * (
@@ -1088,6 +1122,12 @@ class raPDHG(abc.ABC):
             self.pock_chambolle_alpha,
             original_problem,
         )
+        # Route matvecs (A, A', and Q for QPs) through cusparse; the CSR
+        # copies ride on the scaled problem.
+        if self.use_cusparse:
+            scaled_problem = scaled_problem._replace(
+                scaled_qp=attach_csr_matrices(scaled_problem.scaled_qp)
+            )
         precondition_time = timeit.default_timer() - precondition_start_time
         logger.info("Preconditioning Time (seconds): %.2e", precondition_time)
 
@@ -1160,10 +1200,10 @@ class raPDHG(abc.ABC):
                 timeit.default_timer() - feasibility_polishing_start_time
             )
             polished_primal_product = (
-                scaled_problem.scaled_qp.constraint_matrix @ polished_primal_solution
+                scaled_problem.scaled_qp.matvec(polished_primal_solution)
             )
             polished_dual_product = (
-                scaled_problem.scaled_qp.constraint_matrix_t @ polished_dual_solution
+                scaled_problem.scaled_qp.matvec_t(polished_dual_solution)
             )
             polished_primal_obj_product = compute_objective_product(
                 scaled_problem.scaled_qp, polished_primal_solution

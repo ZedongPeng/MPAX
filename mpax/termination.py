@@ -27,14 +27,13 @@ def check_termination_criteria_cupdlpx(
     qp_cache: CachedQuadraticProgramInfo,
     numerical_error: bool,
     norm_ord: float = 2,
-    infeasibility_detection: bool = True,
 ):
     """cuPDLP-x's termination test, for the r2HPDHG LP path.
 
     Optimality is measured the reference's way. The reference carries no
-    infeasibility certificates, so those checks are skipped when
-    infeasibility_detection is off (which is what makes iteration counts
-    comparable to it); with the flag on, MPAX's certificates still apply.
+    infeasibility certificates, so this test never declares
+    PRIMAL_INFEASIBLE/DUAL_INFEASIBLE (which is what makes iteration counts
+    comparable to it).
     """
     ci = compute_cupdlpx_convergence_information(
         scaled_problem, qp_cache, solver_state, norm_ord
@@ -44,34 +43,6 @@ def check_termination_criteria_cupdlpx(
         lambda: (True, TerminationStatus.OPTIMAL),
         lambda: (False, TerminationStatus.UNSPECIFIED),
     )
-
-    if infeasibility_detection:
-        infeasibility_information = evaluate_unscaled_iteration_stats(
-            scaled_problem,
-            qp_cache,
-            solver_state,
-            1.0,
-            criteria.eps_abs / criteria.eps_rel,
-            norm_ord,
-            False,
-            True,
-        ).infeasibility_information
-        should_terminate, termination_status = jax.lax.cond(
-            (should_terminate == False)
-            & primal_infeasibility_criteria_met(
-                criteria.eps_primal_infeasible, infeasibility_information
-            ),
-            lambda: (True, TerminationStatus.PRIMAL_INFEASIBLE),
-            lambda: (should_terminate, termination_status),
-        )
-        should_terminate, termination_status = jax.lax.cond(
-            (should_terminate == False)
-            & dual_infeasibility_criteria_met(
-                criteria.eps_dual_infeasible, infeasibility_information
-            ),
-            lambda: (True, TerminationStatus.DUAL_INFEASIBLE),
-            lambda: (should_terminate, termination_status),
-        )
 
     should_terminate, termination_status = jax.lax.cond(
         (should_terminate == False)

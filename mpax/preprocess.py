@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 from copy import deepcopy
 from typing import Tuple, Union
@@ -13,6 +14,7 @@ from mpax.solver_log import (
     get_col_l2_norms,
 )
 from mpax.utils import QuadraticProgrammingProblem, ScaledQpProblem
+from jax.experimental.sparse import CSR
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +138,118 @@ def validate(p: QuadraticProgrammingProblem) -> bool:
         )
 
     return True
+
+
+# cuPDLP-x's SCALING_EPSILON: a row/column whose pre-sqrt norm is below this
+# is left unscaled (factor 1) rather than blown up by 1/sqrt of a tiny value.
+_SCALING_EPSILON = 1e-12
+
+
+def _clamped_sqrt_rescaling(pre_sqrt_norms):
+    """sqrt of the accumulated norms, with the reference's clamp: any value
+    below 1e-12 (not just exactly 0) maps to a scaling factor of 1."""
+    return jnp.where(
+        pre_sqrt_norms < _SCALING_EPSILON, 1.0, jnp.sqrt(pre_sqrt_norms)
+    )
+
+
+def filter_small_matrix_entries(
+    problem: QuadraticProgrammingProblem, tolerance: float = 1e-9
+) -> QuadraticProgrammingProblem:
+    """Zero out constraint-matrix entries with |a_ij| <= tolerance.
+
+    cuPDLP-x drops such entries unconditionally (matrix_zero_tol = 1e-9)
+    before anything reads the matrix. Zeroing the stored values instead of
+    removing them is equivalent for every product and norm, and keeps the
+    sparsity structure static so the operation is jit-compatible.
+    """
+
+    def _filter(matrix):
+        if isinstance(matrix, (BCOO, BCSR)):
+            data = jnp.where(jnp.abs(matrix.data) <= tolerance, 0.0, matrix.data)
+            if isinstance(matrix, BCOO):
+                return BCOO(
+                    (data, matrix.indices),
+                    shape=matrix.shape,
+                    indices_sorted=matrix.indices_sorted,
+                    unique_indices=matrix.unique_indices,
+                )
+            return BCSR((data, matrix.indices, matrix.indptr), shape=matrix.shape)
+        return jnp.where(jnp.abs(matrix) <= tolerance, 0.0, matrix)
+
+    return dataclasses.replace(
+        problem,
+        constraint_matrix=_filter(problem.constraint_matrix),
+        constraint_matrix_t=_filter(problem.constraint_matrix_t),
+    )
+
+
+def attach_csr_matrices(
+    problem: QuadraticProgrammingProblem,
+) -> QuadraticProgrammingProblem:
+    """Attach cusparse-ready CSR copies of A and A' to a BCOO problem.
+
+    XLA lowers BCOO matvecs to gather/scatter kernels that collapse on
+    matrices with heavy rows (square41: 7.2ms vs cusparse's 78us per SpMV
+    on H100 fp64), so the r2HPDHG iteration routes its products through
+    `sparse.csr_matvec` instead. Built once per solve from the scaled BCOO
+    matrix; jit-compatible (a stable argsort, two bincounts, and casts).
+    Non-BCOO problems are returned unchanged.
+
+    Why not `jax_bcoo_cusparse_lowering` with plain `@`: that flag reaches
+    the same cusparse kernels but its lowering prepends an
+    out-of-bound-index correction pass over data+indices on every call
+    (bcsr.py `_bcsr_correct_out_of_bound_indices`), measured 173-195us vs
+    78us per SpMV on square41. The correction guards padded entries whose
+    indices lie beyond the indptr extent; the CSR built here has
+    indptr[-1] == nse with padding parked on valid indices and zeroed, so
+    the raw primitive is safe without it.
+    """
+    def to_csr(sort_key, minor, vals, n_major, n_minor):
+        order = jnp.argsort(sort_key, stable=True)
+        indptr = jnp.concatenate(
+            [
+                jnp.zeros(1, dtype=jnp.int32),
+                jnp.cumsum(
+                    jnp.bincount(sort_key, length=n_major).astype(jnp.int32)
+                ),
+            ]
+        ).astype(jnp.int32)
+        return CSR(
+            (vals[order], minor[order].astype(jnp.int32), indptr),
+            shape=(n_major, n_minor),
+        )
+
+    def csr_pair(matrix, transpose_too):
+        num_rows, num_cols = matrix.shape
+        rows = matrix.indices[:, 0]
+        cols = matrix.indices[:, 1]
+        data = matrix.data
+        # Padded/out-of-bounds entries (which BCOO ops may carry) must not
+        # contribute: zero their values and park them on a valid index.
+        valid = (rows >= 0) & (rows < num_rows) & (cols >= 0) & (cols < num_cols)
+        data = jnp.where(valid, data, 0.0)
+        rows = jnp.where(valid, rows, num_rows - 1).astype(jnp.int32)
+        cols = jnp.where(valid, cols, num_cols - 1).astype(jnp.int32)
+        forward = to_csr(rows, cols, data, num_rows, num_cols)
+        if not transpose_too:
+            return forward, None
+        return forward, to_csr(cols, rows, data, num_cols, num_rows)
+
+    replacements = {}
+    matrix = problem.constraint_matrix
+    if isinstance(matrix, BCOO) and matrix.shape[0] > 0:
+        a_csr, a_t_csr = csr_pair(matrix, transpose_too=True)
+        replacements["constraint_matrix_csr"] = a_csr
+        replacements["constraint_matrix_t_csr"] = a_t_csr
+    # Q is symmetric, so its own CSR covers both orientations.
+    if isinstance(problem.objective_matrix, BCOO) and problem.objective_matrix.nse > 0:
+        replacements["objective_matrix_csr"] = csr_pair(
+            problem.objective_matrix, transpose_too=False
+        )[0]
+    if not replacements:
+        return problem
+    return dataclasses.replace(problem, **replacements)
 
 
 def scale_problem(
@@ -433,7 +547,7 @@ def ruiz_rescaling(
                 if problem.is_lp
                 else get_col_l_inf_norms(objective_matrix)
             )
-            variable_rescaling = jnp.sqrt(
+            variable_rescaling = _clamped_sqrt_rescaling(
                 jnp.maximum(constraint_col_max, objective_col_max)
             )
         elif p == 2:
@@ -442,7 +556,7 @@ def ruiz_rescaling(
                 if problem.is_lp
                 else get_col_l2_norms(objective_matrix)
             )
-            variable_rescaling = jnp.sqrt(
+            variable_rescaling = _clamped_sqrt_rescaling(
                 jnp.sqrt(
                     jnp.square(get_col_l2_norms(constraint_matrix))
                     + jnp.square(objective_col_l2)
@@ -451,18 +565,13 @@ def ruiz_rescaling(
         else:
             raise ValueError("Norm must be 2 or Inf.")
 
-        # Avoid division by zero by setting zero values to 1.0
-        variable_rescaling = jnp.where(
-            variable_rescaling == 0.0, 1.0, variable_rescaling
-        )
-
         # Determine constraint rescaling
         if num_constraints == 0:
             constraint_rescaling = jnp.array([])
         else:
             if p == float("inf"):
                 constraint_row_max = get_row_l_inf_norms(constraint_matrix)
-                constraint_rescaling = jnp.sqrt(constraint_row_max)
+                constraint_rescaling = _clamped_sqrt_rescaling(constraint_row_max)
             elif p == 2:
                 norm_of_rows = get_row_l2_norms(problem.constraint_matrix)
 
@@ -477,14 +586,11 @@ def ruiz_rescaling(
                         num_variables / (num_constraints + num_variables)
                     )
 
-                constraint_rescaling = jnp.sqrt(norm_of_rows / target_row_norm)
+                constraint_rescaling = _clamped_sqrt_rescaling(
+                    norm_of_rows / target_row_norm
+                )
             else:
                 raise ValueError("Norm must be 2 or inf.")
-
-            # Avoid division by zero
-            constraint_rescaling = jnp.where(
-                constraint_rescaling == 0, 1.0, constraint_rescaling
-            )
 
         # Apply scaling to the problem
         scale_problem(problem, constraint_rescaling, variable_rescaling)
@@ -539,11 +645,11 @@ def pock_chambolle_rescaling(
             if qp.objective_matrix is None
             else jnp.sum(jnp.abs(objective_matrix) ** (2 - alpha), axis=0)
         )
-        variable_rescaling = jnp.sqrt(
+        variable_rescaling = _clamped_sqrt_rescaling(
             jnp.sum(jnp.abs(constraint_matrix) ** (2 - alpha), axis=0) + objective_term
         )
-        constraint_rescaling = jnp.sqrt(
-            jnp.sum(jnp.abs(constraint_matrix) ** (2 - alpha), axis=1)
+        constraint_rescaling = _clamped_sqrt_rescaling(
+            jnp.sum(jnp.abs(constraint_matrix) ** alpha, axis=1)
         )
     elif isinstance(qp.constraint_matrix, BCOO):
         # TODO: improve the code here, instead of using jnp.bincount.
@@ -557,7 +663,7 @@ def pock_chambolle_rescaling(
                 length=objective_matrix.shape[1],
             )
         )
-        variable_rescaling = jnp.sqrt(
+        variable_rescaling = _clamped_sqrt_rescaling(
             jnp.bincount(
                 constraint_matrix.indices[:, 1],
                 weights=jnp.abs(constraint_matrix.data) ** (2 - alpha),
@@ -565,18 +671,13 @@ def pock_chambolle_rescaling(
             )
             + objective_term
         )
-        constraint_rescaling = jnp.sqrt(
+        constraint_rescaling = _clamped_sqrt_rescaling(
             jnp.bincount(
                 constraint_matrix.indices[:, 0],
                 weights=jnp.abs(constraint_matrix.data) ** (alpha),
                 length=constraint_matrix.shape[0],
             )
         )
-
-    variable_rescaling = jnp.where(variable_rescaling == 0, 1.0, variable_rescaling)
-    constraint_rescaling = jnp.where(
-        constraint_rescaling == 0, 1.0, constraint_rescaling
-    )
 
     scale_problem(qp, constraint_rescaling, variable_rescaling)
 

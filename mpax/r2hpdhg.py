@@ -5,22 +5,27 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.sparse import BCOO
+from jax.experimental import sparse as jsparse
+from jax.experimental.sparse import BCOO, CSR
 from jax.lax import cond
 
 from mpax.loop_utils import while_loop
-from mpax.preprocess import rescale_problem
+from mpax.preprocess import (
+    attach_csr_matrices,
+    filter_small_matrix_entries,
+    rescale_problem,
+)
 from mpax.rapdhg import (
     compute_next_solution,
     raPDHG,
 )
 from mpax.restart import (
     compute_cupdlpx_fixed_point_error,
-    compute_new_primal_weight,
+    compute_new_primal_weight_cupdlpx,
     restart_criteria_met_fixed_point,
     should_do_adaptive_restart_cupdlpx,
     unscaled_saddle_point_output,
-    weighted_norm,
+    update_best_primal_weight,
 )
 from mpax.solver_log import (
     display_iteration_stats_heading,
@@ -28,7 +33,6 @@ from mpax.solver_log import (
     setup_logger,
 )
 from mpax.termination import (
-    cached_quadratic_program_info,
     check_termination_criteria,
     check_termination_criteria_cupdlpx,
     check_primal_feasibility,
@@ -36,6 +40,7 @@ from mpax.termination import (
     optimality_criteria_met,
 )
 from mpax.utils import (
+    CachedQuadraticProgramInfo,
     PdhgSolverState,
     QuadraticProgrammingProblem,
     RestartInfo,
@@ -47,6 +52,8 @@ from mpax.utils import (
     TerminationStatus,
     ConvergenceInformation,
     compute_objective_product,
+    cupdlpx_constraint_bound_norm,
+    safe_norm,
 )
 from mpax.feasibility_polishing import (
     set_dual_solution_to_zero,
@@ -60,25 +67,26 @@ logger = logging.getLogger(__name__)
 
 
 @jax.jit
-def power_method_sigma_max(matrix, matrix_t, tolerance=1e-4, max_iterations=400):
+def power_method_sigma_max(matrix, matrix_t, tolerance=1e-4, max_iterations=5000):
     """sigma_max of A by power iteration on A A', stopped on the eigenpair residual.
 
     jitted at module level so repeated solves of same-shaped problems reuse
     the compilation (an eagerly-invoked lax.while_loop recompiles per call).
 
-    The shared `estimate_maximum_singular_value` stops on a probabilistic
-    bound and spends ~300 iterations whatever the instance. This stops as
-    soon as the eigenpair has settled -- 15 iterations on some problems --
-    and caps the ill-separated ones, where the reference's uncapped residual
-    test can run thousands of iterations for accuracy the 0.998 step-size
-    factor does not need. At the cap the estimate is within 0.06% on the
-    benchmark set, comfortably inside that 0.2% margin.
-
-    Power iteration approaches sigma_max from below, so the result is always
-    an under-estimate; the cap must stay tight enough that it does not eat
-    the margin.
+    Cap and tolerance mirror cuPDLP-x (sv_max_iter=5000, sv_tol=1e-4). The
+    cap matters on ill-separated spectra: power iteration approaches
+    sigma_max from below, and an estimate cut short can push
+    step * sigma_true past 1 -- a 400-iteration cap left qnet1_o 1.24% low
+    and the run diverged. The residual test still exits early (sometimes in
+    ~15 iterations) on well-separated problems.
     """
     z0 = jax.random.normal(jax.random.PRNGKey(1), (matrix.shape[0],)) + 1e-8
+
+    def mv(M, v):
+        # CSR operands take the cusparse kernel; BCOO/dense use @.
+        if isinstance(M, CSR):
+            return jsparse.csr_matvec(M, v)
+        return M @ v
 
     def cond_fun(state):
         i, _, _, residual = state
@@ -87,7 +95,7 @@ def power_method_sigma_max(matrix, matrix_t, tolerance=1e-4, max_iterations=400)
     def body_fun(state):
         i, z, _, _ = state
         q = z / jnp.linalg.norm(z)
-        z_new = matrix @ (matrix_t @ q)
+        z_new = mv(matrix, mv(matrix_t, q))
         eigenvalue = jnp.dot(q, z_new)
         return i + 1, z_new, eigenvalue, jnp.linalg.norm(z_new - eigenvalue * q)
 
@@ -108,7 +116,7 @@ class r2HPDHG(raPDHG):
     display_frequency: int = 10
     jit: bool = True
     unroll: bool = False
-    termination_evaluation_frequency: int = 100
+    termination_evaluation_frequency: int = 200
     # cuPDLP-x measures residuals in the 2-norm; the inf-norm default this
     # replaced made r2HPDHG stop at a different point for the same tolerance.
     optimality_norm: float = 2
@@ -126,10 +134,13 @@ class r2HPDHG(raPDHG):
     restart_scheme: int = RestartScheme.ADAPTIVE_KKT
     restart_to_current_metric: int = RestartToCurrentMetric.KKT_GREEDY
     restart_frequency_if_fixed: int = 1000
-    artificial_restart_threshold: float = 0.2
+    # Restart cadence constants are cuPDLP-x's defaults. The primal weight
+    # itself is driven by the reference's PID controller (see
+    # compute_new_primal_weight_cupdlpx), not by the parent's
+    # primal_weight_update_smoothing rule.
+    artificial_restart_threshold: float = 0.36
     sufficient_reduction_for_restart: float = 0.2
-    necessary_reduction_for_restart: float = 0.6
-    primal_weight_update_smoothing: float = 0.6
+    necessary_reduction_for_restart: float = 0.5
     # Halpern PDHG's convergence theory and the cuPDLP-x reference both
     # assume a constant step size; take_step has no line-search path.
     # The field stays (inherited) only so resolve_config can reject an
@@ -138,10 +149,19 @@ class r2HPDHG(raPDHG):
     warm_start: bool = False
     feasibility_polishing: bool = False
     eps_feas_polish: float = 1e-06
-    infeasibility_detection: bool = True
+    # cuPDLP-x carries no infeasibility certificates, so neither does the
+    # r2HPDHG path. Like adaptive_step_size above, the field stays only so
+    # resolve_config can reject an explicit True with a readable error.
+    infeasibility_detection: bool = False
     # cuPDLP-x's post-Ruiz scalar pass on bounds and objective. It also fixes
     # the initial primal weight at 1.0, since both sides are order 1 after it.
-    bound_objective_rescaling: bool = False
+    # On by default, as in the reference.
+    bound_objective_rescaling: bool = True
+    # use_cusparse is inherited from raPDHG (default True). On the LP
+    # benchmark it pays off across the board: square41 (heavy rows,
+    # 7.2ms -> 78us per SpMV) and cont1 (whose unsorted lazy-transpose
+    # matvec cost 152us per call on the BCOO path); tiny instances pay a
+    # bounded fixed overhead (2club: ~11us -> ~45us per iteration).
 
     def resolve_config(self, is_lp: bool) -> SolveConfig:
         if not is_lp:
@@ -154,6 +174,12 @@ class r2HPDHG(raPDHG):
                 "r2HPDHG uses a constant step size (Halpern PDHG's "
                 "convergence guarantee requires it); adaptive_step_size is "
                 "not supported. Use raPDHG for an adaptive line search."
+            )
+        if self.infeasibility_detection:
+            raise ValueError(
+                "r2HPDHG matches cuPDLP-x, which computes no infeasibility "
+                "certificates; infeasibility_detection is not supported. "
+                "Use raPDHG to detect primal/dual infeasibility."
             )
         return super().resolve_config(is_lp)
 
@@ -210,8 +236,31 @@ class r2HPDHG(raPDHG):
         if self.bound_objective_rescaling:
             # Bounds and objective are both order 1 after that pass, so the
             # reference starts the weight at 1 rather than at ||c||/||b||.
-            solver_state = solver_state.replace(primal_weight=1.0)
             initial_primal_weight = 1.0
+        else:
+            # cuPDLP-x's fallback: (||c|| + 1) / (||b|| + 1) on the unscaled
+            # problem, with range rows contributing both bounds to ||b||.
+            # The parent's ||c||/||b|| on the scaled problem is a different
+            # starting weight on essentially every instance.
+            initial_primal_weight = (
+                safe_norm(
+                    scaled_problem.original_qp.objective_vector,
+                    ord=self.optimality_norm,
+                )
+                + 1.0
+            ) / (
+                cupdlpx_constraint_bound_norm(
+                    scaled_problem.original_qp, self.optimality_norm
+                )
+                + 1.0
+            )
+        solver_state = solver_state.replace(primal_weight=initial_primal_weight)
+        # The PID weight controller falls back to the best weight seen so
+        # far when its update guard fails; before any restart that is the
+        # initial weight.
+        last_restart_info = last_restart_info.replace(
+            best_primal_weight=initial_primal_weight
+        )
         return solver_state, last_restart_info, initial_primal_weight
 
     def compute_constant_step_size_norms(self, scaled_qp, is_lp):
@@ -224,6 +273,10 @@ class r2HPDHG(raPDHG):
         self._norm_Q = 0.0
         if scaled_qp.constraint_matrix.shape[0] == 0:
             self._norm_A = 0.0
+        elif scaled_qp.constraint_matrix_csr is not None:
+            self._norm_A = power_method_sigma_max(
+                scaled_qp.constraint_matrix_csr, scaled_qp.constraint_matrix_t_csr
+            )
         else:
             self._norm_A = power_method_sigma_max(
                 scaled_qp.constraint_matrix, scaled_qp.constraint_matrix_t
@@ -256,25 +309,28 @@ class r2HPDHG(raPDHG):
             (pdhg_primal - unprojected) / primal_step if window_end else None
         )
         delta_primal = pdhg_primal - solver_state.current_primal_solution
-        if window_end:
+        if window_end or problem.constraint_matrix_csr is not None:
             # The restart test and perform_restart read delta_primal_product,
-            # so the window's last step forms it explicitly.
-            delta_primal_product = problem.constraint_matrix @ delta_primal
+            # so the window's last step forms it explicitly. With the CSR
+            # fast path attached, every step forms it: one cusparse SpMV
+            # beats the old scatter-add lean trick by ~90x on heavy-row
+            # matrices, and the explicit A dx costs nothing extra there.
+            delta_primal_product = problem.matvec(delta_primal)
             # A @ (x + 2 dx), i.e. the product of the reflected primal. The
             # dual update and the Halpern average of the product both need
             # it, and they sit in different scopes, so form it once here.
             reflected_primal_product = (
                 solver_state.current_primal_product + 2 * delta_primal_product
             )
+            if not window_end:
+                delta_primal_product = None
         elif isinstance(problem.constraint_matrix, BCOO):
-            # Inside a window nothing reads A dx on its own, so its
-            # contributions are scatter-added straight onto A x: this drops
-            # the matvec's zero-init and the separate A x + 2 dx pass, worth
-            # ~25% per iteration on mid-size MIPLIB LPs (H100, fp64). The
-            # default scatter mode drops out-of-bounds rows, which is
-            # exactly what padded BCOO entries need. Reassociates the sum
-            # relative to the window-end formula (same values up to fp
-            # rounding).
+            # BCOO fallback (no CSR attached, e.g. CPU): scatter-add the
+            # contributions straight onto A x, which drops the matvec's
+            # zero-init and the separate A x + 2 dx pass. The default
+            # scatter mode drops out-of-bounds rows, which is exactly what
+            # padded BCOO entries need. Reassociates the sum relative to
+            # the window-end formula (same values up to fp rounding).
             delta_primal_product = None
             indices = problem.constraint_matrix.indices
             reflected_primal_product = solver_state.current_primal_product.at[
@@ -370,7 +426,7 @@ class r2HPDHG(raPDHG):
             weight * (solver_state.current_dual_solution + 2 * delta_dual)
             + (1 - weight) * solver_state.initial_dual_solution
         )
-        next_dual_product = problem.constraint_matrix_t @ next_dual_solution
+        next_dual_product = problem.matvec_t(next_dual_solution)
 
         if not window_end:
             # Pass-throughs: loop-invariant in the window's fori_loop, so no
@@ -448,7 +504,13 @@ class r2HPDHG(raPDHG):
         return self.take_step(inner_state, problem, cfg)
 
     def perform_restart(
-        self, solver_state, last_restart_info, kkt_reduction_ratio, problem, cfg
+        self,
+        solver_state,
+        last_restart_info,
+        kkt_reduction_ratio,
+        problem,
+        cfg,
+        residual_ratio,
     ):
         # Take a pure PDHG step to get the new solution and set it as the initial solution for the outer iteration.
         # Use the pure PDHG step solution, instead of the Halpen PDHG step solution, as the initial solution for the restart.
@@ -467,17 +529,12 @@ class r2HPDHG(raPDHG):
             - weight * solver_state.initial_dual_solution
             - solver_state.delta_dual
         )
-        last_iteration_primal_product = (
-            (1 + weight) * solver_state.current_primal_product
-            - weight * solver_state.initial_primal_product
-            - solver_state.delta_primal_product
-        )
-        # A' y at the reconstructed point -- the other three products above are
-        # all taken at last_iteration_*, so taking this one at the Halpern
-        # iterate instead left the restarted state internally inconsistent.
-        last_iteration_dual_product = (
-            problem.constraint_matrix_t @ last_iteration_dual_solution
-        )
+        # Recompute both products fresh at the reconstructed point. The
+        # reference forms A x by SpMV every iteration, while the windows here
+        # accumulate it incrementally; one SpMV per restart resets that fp
+        # drift so it cannot compound across restart periods.
+        last_iteration_primal_product = problem.matvec(last_iteration_primal_solution)
+        last_iteration_dual_product = problem.matvec_t(last_iteration_dual_solution)
         last_iteration_solver_state = PdhgSolverState(
             current_primal_solution=last_iteration_primal_solution,
             current_dual_solution=last_iteration_dual_solution,
@@ -518,8 +575,44 @@ class r2HPDHG(raPDHG):
         restarted_solver_state.initial_primal_product = last_iteration_primal_product
         restarted_solver_state.initial_dual_product = last_iteration_dual_product
 
-        # The reference probes one PDHG step at the anchor to seed its restart
-        # baseline, without advancing the iterate.
+        # Movement over the restart period, as the reference measures it:
+        # plain L2 norms of (new anchor - previous anchor). The PID guard
+        # thresholds below are calibrated to these raw distances.
+        primal_distance_moved_last_restart_period = safe_norm(
+            restarted_solver_state.initial_primal_solution
+            - last_restart_info.primal_solution
+        )
+        dual_distance_moved_last_restart_period = safe_norm(
+            restarted_solver_state.initial_dual_solution
+            - last_restart_info.dual_solution
+        )
+
+        new_primal_weight, new_error_sum, new_last_error = (
+            compute_new_primal_weight_cupdlpx(
+                primal_distance_moved_last_restart_period,
+                dual_distance_moved_last_restart_period,
+                residual_ratio,
+                solver_state.primal_weight,
+                last_restart_info.primal_weight_error_sum,
+                last_restart_info.primal_weight_last_error,
+                last_restart_info.best_primal_weight,
+            )
+        )
+        new_best_primal_weight, new_best_gap = update_best_primal_weight(
+            residual_ratio,
+            new_primal_weight,
+            last_restart_info.best_primal_weight,
+            last_restart_info.best_primal_dual_residual_gap,
+        )
+        restarted_solver_state.primal_weight = new_primal_weight
+        restarted_solver_state.solutions_count = 0
+        restarted_solver_state.weights_sum = 0.0
+
+        # The reference seeds its restart baseline from the first real step
+        # of the next window, which runs with the new weight already synced.
+        # Probing that step here (without advancing the iterate) reproduces
+        # it exactly: the window's own first step recomputes the same deltas
+        # from the same anchor with the same weight.
         probe_delta_primal, probe_delta_primal_product, probe_delta_dual = (
             compute_next_solution(
                 problem, restarted_solver_state, restarted_solver_state.step_size, 1.0
@@ -529,22 +622,6 @@ class r2HPDHG(raPDHG):
         restarted_solver_state.delta_dual = probe_delta_dual
         restarted_solver_state.delta_primal_product = probe_delta_primal_product
 
-        primal_norm_params = (
-            1 / restarted_solver_state.step_size * restarted_solver_state.primal_weight
-        )
-        dual_norm_params = (
-            1 / restarted_solver_state.step_size / restarted_solver_state.primal_weight
-        )
-        primal_distance_moved_last_restart_period = weighted_norm(
-            restarted_solver_state.initial_primal_solution
-            - last_restart_info.primal_solution,
-            primal_norm_params,
-        ) / jnp.sqrt(solver_state.primal_weight)
-        dual_distance_moved_last_restart_period = weighted_norm(
-            restarted_solver_state.initial_dual_solution
-            - last_restart_info.dual_solution,
-            dual_norm_params,
-        ) * jnp.sqrt(solver_state.primal_weight)
         new_last_restart_info = RestartInfo(
             primal_solution=restarted_solver_state.initial_primal_solution,
             dual_solution=restarted_solver_state.initial_dual_solution,
@@ -558,30 +635,19 @@ class r2HPDHG(raPDHG):
             primal_distance_moved_last_restart_period=primal_distance_moved_last_restart_period,
             dual_distance_moved_last_restart_period=dual_distance_moved_last_restart_period,
             reduction_ratio_last_trial=kkt_reduction_ratio,
-        )
-
-        restarted_solver_state.primal_weight = compute_new_primal_weight(
-            new_last_restart_info,
-            solver_state.primal_weight,
-            cfg.primal_weight_update_smoothing,
-        )
-        restarted_solver_state.solutions_count = 0
-        restarted_solver_state.weights_sum = 0.0
-
-        # cuPDLP-x re-probes the fixed-point error at the restarted point,
-        # after the new primal weight is in place. The take_step above
-        # already produced exactly the deltas that probe needs, so this
-        # costs no extra step.
-        new_last_restart_info.initial_fixed_point_error = (
-            compute_cupdlpx_fixed_point_error(
+            initial_fixed_point_error=compute_cupdlpx_fixed_point_error(
                 restarted_solver_state.delta_primal,
                 restarted_solver_state.delta_dual,
                 restarted_solver_state.delta_primal_product,
                 restarted_solver_state.step_size,
                 restarted_solver_state.primal_weight,
-            )
+            ),
+            last_trial_fixed_point_error=jnp.inf,
+            primal_weight_error_sum=new_error_sum,
+            primal_weight_last_error=new_last_error,
+            best_primal_weight=new_best_primal_weight,
+            best_primal_dual_residual_gap=new_best_gap,
         )
-        new_last_restart_info.last_trial_fixed_point_error = jnp.inf
         return restarted_solver_state, new_last_restart_info
 
     def run_restart_scheme(
@@ -590,6 +656,7 @@ class r2HPDHG(raPDHG):
         solver_state: PdhgSolverState,
         last_restart_info: RestartInfo,
         cfg: SolveConfig,
+        convergence_information: ConvergenceInformation,
     ):
         """
         Check restart criteria based on current and average KKT residuals.
@@ -604,6 +671,9 @@ class r2HPDHG(raPDHG):
             Information from the last restart.
         cfg : SolveConfig
             The per-solve configuration derived by `resolve_config`.
+        convergence_information : ConvergenceInformation
+            Residuals of the window just evaluated; the PID weight
+            controller's guard reads their dual/primal ratio.
 
         Returns
         -------
@@ -616,13 +686,22 @@ class r2HPDHG(raPDHG):
             last_restart_info,
             self.termination_evaluation_frequency,
         )
+        residual_ratio = (
+            convergence_information.relative_dual_residual_norm
+            / convergence_information.relative_primal_residual_norm
+        )
         # A restart clears the trial error (the reference resets it to inf, so
         # `error_increased` cannot fire on the first check of a new restart
         # period); otherwise the check records what it just measured.
         return cond(
             do_restart,
             lambda: self.perform_restart(
-                solver_state, last_restart_info, fixed_point_error, problem, cfg
+                solver_state,
+                last_restart_info,
+                fixed_point_error,
+                problem,
+                cfg,
+                residual_ratio,
             ),
             lambda: (
                 solver_state,
@@ -674,56 +753,11 @@ class r2HPDHG(raPDHG):
                 kkt_reduction_ratio,
                 problem,
                 cfg,
+                # Polishing has no cuPDLP-x residual pair at hand; a neutral
+                # ratio passes the PID guard and leaves the log10 gap at 0.
+                jnp.asarray(1.0),
             ),
             lambda: (current_solver_state, last_restart_info),
-        )
-
-    def initial_iteration_update(
-        self,
-        cfg,
-        solver_state,
-        last_restart_info,
-        should_terminate,
-        scaled_problem,
-        qp_cache,
-    ):
-        """The inner loop of PDLP algorithm.
-
-        Parameters
-        ----------
-        cfg : SolveConfig
-            The per-solve configuration derived by `resolve_config`.
-        solver_state : PdhgSolverState
-            The current state of the solver.
-        last_restart_info : RestartInfo
-            The information of the last restart.
-        should_terminate : bool
-            Whether the algorithm should terminate.
-        scaled_problem : ScaledQpProblem
-            The original problem and scaled problem data.
-        qp_cache : CachedQuadraticProgramInfo
-            The cached quadratic programming information.
-
-        Returns
-        -------
-        tuple
-            The updated solver state, the updated last restart info, whether to terminate, the scaled problem, and the cached quadratic programming information.
-        """
-        # Skip termination check for initial iterations
-        restarted_solver_state, new_last_restart_info = self.run_restart_scheme(
-            scaled_problem.scaled_qp, solver_state, last_restart_info, cfg
-        )
-
-        new_solver_state = self.take_step(
-            restarted_solver_state, scaled_problem.scaled_qp, cfg
-        )
-        new_solver_state.termination_status = TerminationStatus.UNSPECIFIED
-        return (
-            new_solver_state,
-            new_last_restart_info,
-            False,
-            scaled_problem,
-            qp_cache,
         )
 
     def main_iteration_update(
@@ -752,12 +786,15 @@ class r2HPDHG(raPDHG):
                 qp_cache,
                 stepped_solver_state.numerical_error,
                 self.optimality_norm,
-                cfg.infeasibility_detection,
             )
         )
 
         new_solver_state, new_last_restart_info = self.run_restart_scheme(
-            scaled_problem.scaled_qp, stepped_solver_state, last_restart_info, cfg
+            scaled_problem.scaled_qp,
+            stepped_solver_state,
+            last_restart_info,
+            cfg,
+            convergence_information,
         )
 
         new_solver_state.termination_status = termination_status
@@ -995,7 +1032,15 @@ class r2HPDHG(raPDHG):
         # validate(original_problem)
         # config_check(params)
         cfg = self.resolve_config(original_problem.is_lp)
-        qp_cache = cached_quadratic_program_info(original_problem, self.optimality_norm)
+        # cuPDLP-x drops |a_ij| <= 1e-9 before anything reads the matrix, so
+        # the filtered matrix is what scaling, sigma_max, and residuals see.
+        original_problem = filter_small_matrix_entries(original_problem)
+        # ||b|| the reference's way: a range row contributes both of its
+        # bounds, where cached_quadratic_program_info keeps only the larger.
+        qp_cache = CachedQuadraticProgramInfo(
+            safe_norm(original_problem.objective_vector, ord=self.optimality_norm),
+            cupdlpx_constraint_bound_norm(original_problem, self.optimality_norm),
+        )
 
         precondition_start_time = timeit.default_timer()
         scaled_problem = rescale_problem(
@@ -1005,6 +1050,12 @@ class r2HPDHG(raPDHG):
             original_problem,
             self.bound_objective_rescaling,
         )
+        # Route every per-iteration product through cusparse: the CSR copies
+        # ride on the scaled problem so the jitted loops can reach them.
+        if self.use_cusparse:
+            scaled_problem = scaled_problem._replace(
+                scaled_qp=attach_csr_matrices(scaled_problem.scaled_qp)
+            )
         precondition_time = timeit.default_timer() - precondition_start_time
         logger.info("Preconditioning Time (seconds): %.2e", precondition_time)
 

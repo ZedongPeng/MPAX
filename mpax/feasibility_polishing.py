@@ -47,15 +47,26 @@ def init_primal_feasibility_polishing(
             objective_matrix=zero_objective_matrix,
             objective_vector=zero_objective_vector,
             objective_constant=0.0,
+            # The cusparse copy of Q must not outlive the zeroed Q, or
+            # compute_objective_product would keep multiplying by the
+            # original objective matrix.
+            objective_matrix_csr=None,
         ),
         scaled_qp=dataclass_replace(
             scaled_problem.scaled_qp,
             objective_matrix=zero_scaled_objective_matrix,
             objective_vector=zero_objective_vector,
             objective_constant=0.0,
+            objective_matrix_csr=None,
         ),
         constraint_rescaling=scaled_problem.constraint_rescaling,
         variable_rescaling=scaled_problem.variable_rescaling,
+        # The scalar bound/objective factors must ride along: the polishing
+        # problem's scaled data was produced with them, and dropping them to
+        # the 1.0 default makes every unscaled residual wrong whenever
+        # bound_objective_rescaling is on.
+        constraint_bound_rescaling=scaled_problem.constraint_bound_rescaling,
+        objective_vector_rescaling=scaled_problem.objective_vector_rescaling,
     )
     zero_dual_solution = jnp.zeros_like(solver_state.current_dual_solution)
     zero_dual_product = jnp.zeros_like(solver_state.current_dual_product)
@@ -170,6 +181,12 @@ def init_dual_feasibility_polishing(
         ),
         constraint_rescaling=scaled_problem.constraint_rescaling,
         variable_rescaling=scaled_problem.variable_rescaling,
+        # The scalar bound/objective factors must ride along: the polishing
+        # problem's scaled data was produced with them, and dropping them to
+        # the 1.0 default makes every unscaled residual wrong whenever
+        # bound_objective_rescaling is on.
+        constraint_bound_rescaling=scaled_problem.constraint_bound_rescaling,
+        objective_vector_rescaling=scaled_problem.objective_vector_rescaling,
     )
     # Check for termination
     zero_primal_solution = jnp.zeros_like(solver_state.current_primal_solution)

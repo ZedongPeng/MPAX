@@ -805,6 +805,81 @@ def compute_new_primal_weight(
     return new_primal_weight
 
 
+# cuPDLP-x's PID primal-weight controller gains (its defaults; k_d exists in
+# the reference but defaults to 0). Hardcoded rather than configurable, like
+# the reference's users see them.
+_PID_K_P = 0.99
+_PID_K_I = 0.01
+_PID_K_D = 0.0
+_PID_I_SMOOTH = 0.3
+
+
+def compute_new_primal_weight_cupdlpx(
+    primal_distance,
+    dual_distance,
+    residual_ratio,
+    primal_weight,
+    error_sum,
+    last_error,
+    best_weight,
+):
+    """cuPDLP-x's primal weight update at restart, used by r2HPDHG.
+
+    A PID controller in log space drives the weight toward
+    dual_distance / primal_distance: error = log(dd) - log(pd) - log(w),
+    error_sum = 0.3 * error_sum + error, then
+    w *= exp(0.99 * error + 0.01 * error_sum). The update only runs when
+    both restart-period movements are in (1e-16, 1e12) and the
+    dual/primal residual ratio is in (1e-8, 1e8); otherwise the weight
+    reverts to the best (most residual-balanced) weight seen so far and
+    the controller state resets.
+
+    Returns (new_weight, new_error_sum, new_last_error).
+    """
+    guard = (
+        (primal_distance > 1e-16)
+        & (dual_distance > 1e-16)
+        & (primal_distance < 1e12)
+        & (dual_distance < 1e12)
+        & (residual_ratio > 1e-8)
+        & (residual_ratio < 1e8)
+    )
+
+    def pid_update():
+        error = (
+            jnp.log(dual_distance) - jnp.log(primal_distance) - jnp.log(primal_weight)
+        )
+        new_error_sum = _PID_I_SMOOTH * error_sum + error
+        delta_error = error - last_error
+        new_weight = primal_weight * jnp.exp(
+            _PID_K_P * error + _PID_K_I * new_error_sum + _PID_K_D * delta_error
+        )
+        return new_weight, new_error_sum, error
+
+    def fallback():
+        zero = jnp.zeros_like(jnp.asarray(error_sum, dtype=float))
+        return jnp.asarray(best_weight, dtype=float), zero, zero
+
+    return jax.lax.cond(guard, pid_update, fallback)
+
+
+def update_best_primal_weight(residual_ratio, new_weight, best_weight, best_gap):
+    """Track the weight at the most balanced dual/primal residual ratio.
+
+    cuPDLP-x records |log10(rel_dual / rel_primal)| at every restart and,
+    when it improves, stores the just-updated weight as the fallback for
+    `compute_new_primal_weight_cupdlpx`'s guard failures.
+
+    Returns (new_best_weight, new_best_gap).
+    """
+    gap = jnp.abs(jnp.log10(residual_ratio))
+    improved = gap < best_gap
+    return (
+        jnp.where(improved, new_weight, best_weight),
+        jnp.where(improved, gap, best_gap),
+    )
+
+
 def select_initial_primal_weight(
     problem,
     primal_norm_params: float,

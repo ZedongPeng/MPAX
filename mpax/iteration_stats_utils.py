@@ -322,8 +322,8 @@ def compute_cupdlpx_convergence_information(
     # Both products are formed here rather than carried: this runs once per
     # evaluation window, so two matvecs are cheaper than maintaining them on
     # every one of the ~200 steps in between.
-    primal_product = problem.constraint_matrix @ primal_iterate
-    dual_product = problem.constraint_matrix_t @ dual_iterate
+    primal_product = problem.matvec(primal_iterate)
+    dual_product = problem.matvec_t(dual_iterate)
     dual_slack = solver_state.dual_slack
 
     # Undo the Ruiz/Pock-Chambolle scaling before measuring, as the
@@ -585,6 +585,21 @@ def evaluate_unscaled_iteration_stats(
             solver_state.current_primal_obj_product * scaled_problem.variable_rescaling,
         ),
     )
+    # bound_objective_rescaling's scalar factors (1.0 when that pass is off,
+    # so raPDHG paths are untouched): bounds were multiplied by s_b and the
+    # objective by s_c, so primal-side quantities carry 1/s_b and dual-side
+    # quantities 1/s_c back to original units. Without this, the polishing
+    # feasibility checks measure an s_b-shrunk iterate against the original
+    # bounds and can never reach their tolerance.
+    s_b = scaled_problem.constraint_bound_rescaling
+    s_c = scaled_problem.objective_vector_rescaling
+    unscaled_primal_solution = unscaled_primal_solution / s_b
+    unscaled_primal_product = unscaled_primal_product / s_b
+    unscaled_dual_solution = unscaled_dual_solution / s_c
+    unscaled_dual_product = unscaled_dual_product / s_c
+    # Qx is a c-unit term of the dual residual; identically zero on the only
+    # path that enables the scalar pass (r2HPDHG is LP-only).
+    unscaled_primal_obj_product = unscaled_primal_obj_product / s_c
     convergence_information = compute_convergence_information(
         scaled_problem.original_qp,
         qp_cache,

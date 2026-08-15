@@ -8,7 +8,8 @@ from jax.tree_util import register_dataclass
 
 import chex
 from jax import numpy as jnp
-from jax.experimental.sparse import BCOO, BCSR
+from jax.experimental import sparse
+from jax.experimental.sparse import BCOO, BCSR, CSR
 
 
 class TerminationStatus(IntEnum):
@@ -130,6 +131,9 @@ class CachedQuadraticProgramInfo(NamedTuple):
         "constraint_matrix_t",
         "constraint_lower_bound",
         "constraint_upper_bound",
+        "constraint_matrix_csr",
+        "constraint_matrix_t_csr",
+        "objective_matrix_csr",
     ],
     meta_fields=["is_lp"],
 )
@@ -187,6 +191,28 @@ class QuadraticProgrammingProblem:
     constraint_lower_bound: jnp.ndarray
     constraint_upper_bound: jnp.ndarray
     is_lp: bool
+    # cuSparse fast path (r2HPDHG): CSR copies of the constraint matrix and
+    # its transpose, attached by preprocess.attach_csr_matrices after
+    # scaling. None outside that path; matvec()/matvec_t() fall back to the
+    # fields above. XLA's BCOO matvec lowers to gather/scatter and is up to
+    # ~90x slower than cusparse on heavy-row matrices (square41: 7.2ms vs
+    # 78us per SpMV, H100 fp64).
+    constraint_matrix_csr: Optional[CSR] = None
+    constraint_matrix_t_csr: Optional[CSR] = None
+    # Q is symmetric, so one CSR serves both orientations.
+    objective_matrix_csr: Optional[CSR] = None
+
+    def matvec(self, v):
+        """A @ v through cusparse when the CSR copy is attached."""
+        if self.constraint_matrix_csr is not None:
+            return sparse.csr_matvec(self.constraint_matrix_csr, v)
+        return self.constraint_matrix @ v
+
+    def matvec_t(self, v):
+        """A' @ v through cusparse when the CSR copy is attached."""
+        if self.constraint_matrix_t_csr is not None:
+            return sparse.csr_matvec(self.constraint_matrix_t_csr, v)
+        return self.constraint_matrix_t @ v
 
 
 class RestartScheme(IntEnum):
@@ -307,6 +333,13 @@ class RestartInfo:
     # which is what the reference does.
     initial_fixed_point_error: float = 0.0
     last_trial_fixed_point_error: float = jnp.inf
+    # r2HPDHG only: cuPDLP-x's PID primal-weight controller state, plus the
+    # most balanced weight seen so far, which the controller reverts to when
+    # its update guard fails.
+    primal_weight_error_sum: float = 0.0
+    primal_weight_last_error: float = 0.0
+    best_primal_weight: float = 1.0
+    best_primal_dual_residual_gap: float = jnp.inf
 
 
 class RestartParameters(NamedTuple):
@@ -689,6 +722,8 @@ def compute_objective_product(problem, primal_solution):
     """
     if problem.is_lp:
         return jnp.zeros_like(primal_solution)
+    if problem.objective_matrix_csr is not None:
+        return sparse.csr_matvec(problem.objective_matrix_csr, primal_solution)
     return problem.objective_matrix @ primal_solution
 
 
@@ -713,6 +748,26 @@ def combined_constraint_bounds(problem):
     return jnp.where(
         jnp.abs(lower_finite) > jnp.abs(upper_finite), lower_finite, upper_finite
     )
+
+
+def cupdlpx_constraint_bound_norm(problem, ord=2):
+    """cuPDLP-x's ||b|| for the termination denominators and initial weight.
+
+    A finite lower bound counts unless the row is an equality (lower ==
+    upper); a finite upper bound always counts. A range row therefore
+    contributes both of its bounds, where `combined_constraint_bounds`
+    keeps only the larger one.
+    """
+    lower = problem.constraint_lower_bound
+    upper = problem.constraint_upper_bound
+    lower_counted = jnp.where(jnp.isfinite(lower) & (lower != upper), lower, 0.0)
+    upper_counted = jnp.where(jnp.isfinite(upper), upper, 0.0)
+    if ord == float("inf"):
+        return jnp.maximum(
+            jnp.max(jnp.abs(lower_counted), initial=0.0),
+            jnp.max(jnp.abs(upper_counted), initial=0.0),
+        )
+    return jnp.sqrt(jnp.sum(lower_counted**2) + jnp.sum(upper_counted**2))
 
 
 def safe_norm(x, ord=None):
