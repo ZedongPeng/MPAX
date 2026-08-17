@@ -248,8 +248,54 @@ def create_qp_standard_form(Q, c, A, b, G, h, l, u, use_sparse_matrix=True):
     return create_qp(Q, c, constraint_matrix, lc, uc, l, u, use_sparse_matrix)
 
 
+def _fold_gurobi_range_slacks(model, A, lc, uc, lb, ub, obj):
+    """Fold Gurobi's range-constraint slack columns back into row bounds.
+
+    Gurobi stores a ranged row `lo <= a'x <= hi` (an MPS RANGES entry, or
+    Model.addRange) as the equality `a'x + s = rhs` plus an auxiliary
+    continuous variable `s`, named `MPS_Rg<row>` by the MPS reader and
+    `Rg<row>` by addRange. The two-sided problem needs no such column:
+    the row bound simply becomes `[rhs - a*ub_s, rhs - a*lb_s]` (sign of
+    `a` respected). Solving the slack form instead changes the LP that
+    PDHG sees -- an extra column per ranged row and no two-sided rows --
+    so iteration counts diverge from solvers that read RANGES natively.
+    (cont1/cont11/ns930473/ns1644855 in the MIPLIB/Mittelmann LP sets.)
+
+    Only columns that are unmistakably such slacks are folded: name
+    prefix `MPS_Rg`/`Rg`, exactly one nonzero, zero objective, and an
+    equality row. Returns the reduced (A, lc, uc, lb, ub, obj) and the
+    kept-column index (None when nothing was folded).
+    """
+    names = model.getAttr("VarName", model.getVars())
+    cand = [j for j, n in enumerate(names) if n.startswith("MPS_Rg") or n.startswith("Rg")]
+    if not cand:
+        return A, lc, uc, lb, ub, obj, None
+    A = A.tocsc()
+    nnz_per_col = np.diff(A.indptr)
+    lc = np.array(lc, dtype=float)
+    uc = np.array(uc, dtype=float)
+    fold = []
+    for j in cand:
+        if nnz_per_col[j] != 1 or obj[j] != 0.0:
+            continue
+        i = A.indices[A.indptr[j]]
+        if lc[i] != uc[i]:  # not an equality row: not Gurobi's range encoding
+            continue
+        fold.append(j)
+        a = A.data[A.indptr[j]]
+        lo, hi = (a * ub[j], a * lb[j]) if a > 0 else (a * lb[j], a * ub[j])
+        # a'x = rhs - a*s with s in [lb, ub]  ->  a'x in [rhs - max, rhs - min]
+        rhs = lc[i]
+        lc[i] = rhs - lo
+        uc[i] = rhs - hi
+    if not fold:
+        return A, lc, uc, lb, ub, obj, None
+    keep = np.setdiff1d(np.arange(A.shape[1]), np.array(fold))
+    return A[:, keep], lc, uc, lb[keep], ub[keep], obj[keep], keep
+
+
 def create_qp_from_gurobi(
-    model, use_sparse_matrix=True, sharding=None
+    model, use_sparse_matrix=True, sharding=None, fold_range_slacks=True
 ) -> QuadraticProgrammingProblem:
     """Build a two-sided QuadraticProgrammingProblem from a gurobipy model.
 
@@ -261,6 +307,13 @@ def create_qp_from_gurobi(
         Whether to use sparse matrix format, by default True.
     sharding : jax.sharding.Sharding
         The sharding to use, by default None.
+    fold_range_slacks : bool
+        Whether to fold Gurobi's auxiliary range-constraint slack columns
+        (`MPS_Rg*` from the MPS reader, `Rg*` from Model.addRange) back into
+        two-sided row bounds instead of keeping them as variables, by
+        default True. When any are folded the returned problem has fewer
+        variables than `model.NumVars`; pass False to keep Gurobi's exact
+        variable layout.
 
     Returns
     -------
@@ -270,35 +323,43 @@ def create_qp_from_gurobi(
     """
     constraint_sense = np.array(model.getAttr("Sense", model.getConstrs()))
     constraint_rhs = np.array(model.getAttr("RHS", model.getConstrs()))
-    constraint_lower_bound = jnp.array(
-        np.where(constraint_sense == "<", -np.inf, constraint_rhs)
-    )
-    constraint_upper_bound = jnp.array(
-        np.where(constraint_sense == ">", np.inf, constraint_rhs)
-    )
+    lc = np.where(constraint_sense == "<", -np.inf, constraint_rhs)
+    uc = np.where(constraint_sense == ">", np.inf, constraint_rhs)
+
+    A = model.getA()
+    Q = model.getQ()
+    var_lb = np.array(model.getAttr("LB", model.getVars()), dtype=float)
+    var_ub = np.array(model.getAttr("UB", model.getVars()), dtype=float)
+    obj = np.array(model.getAttr("Obj", model.getVars()), dtype=float)
+    keep = None
+    if fold_range_slacks:
+        A, lc, uc, var_lb, var_ub, obj, keep = _fold_gurobi_range_slacks(
+            model, A, lc, uc, var_lb, var_ub, obj
+        )
+    if keep is not None and Q.nnz > 0:
+        Q = Q.tocsr()[keep][:, keep]
+
+    constraint_lower_bound = jnp.array(lc)
+    constraint_upper_bound = jnp.array(uc)
 
     if use_sparse_matrix:
-        constraint_matrix = BCOO.from_scipy_sparse(model.getA())
+        constraint_matrix = BCOO.from_scipy_sparse(A)
     else:
-        constraint_matrix = jnp.array(model.getA().toarray())
+        constraint_matrix = jnp.array(A.toarray())
 
-    is_lp = model.getQ().nnz == 0
+    is_lp = Q.nnz == 0
     if is_lp:
         objective_matrix = None
     elif use_sparse_matrix:
-        objective_matrix = 2 * BCOO.from_scipy_sparse(
-            (model.getQ() + model.getQ().T) / 2
-        )
+        objective_matrix = 2 * BCOO.from_scipy_sparse((Q + Q.T) / 2)
     else:
-        objective_matrix = 2 * jnp.array(
-            ((model.getQ() + model.getQ().T) / 2).toarray()
-        )
+        objective_matrix = 2 * jnp.array(((Q + Q.T) / 2).toarray())
     if sharding is not None:
         constraint_matrix = jax.device_put(constraint_matrix, sharding)
 
-    var_lb = jnp.array(model.getAttr("LB", model.getVars()))
-    var_ub = jnp.array(model.getAttr("UB", model.getVars()))
-    objective_vector = jnp.array(model.getAttr("Obj", model.getVars()))
+    var_lb = jnp.array(var_lb)
+    var_ub = jnp.array(var_ub)
+    objective_vector = jnp.array(obj)
     objective_constant = model.ObjCon
 
     return QuadraticProgrammingProblem(

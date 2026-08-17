@@ -14,6 +14,19 @@
   1e-8) — re-baseline before gating.
 
 ### Changed
+- `create_qp_from_gurobi` folds Gurobi's range-constraint slack columns
+  back into two-sided row bounds (`fold_range_slacks=True`, new
+  keyword). Gurobi encodes a ranged row -- an MPS RANGES entry or
+  `Model.addRange` -- as an equality plus an auxiliary variable
+  (`MPS_Rg<row>` / `Rg<row>`, bounded, zero cost, one nonzero); the
+  problem handed to the solver used to inherit that column and lose
+  the two-sided row. cont1/cont11/ns930473/ns1644855 are the affected
+  LP-benchmark instances (ns930473: 33748 -> 11328 columns), and they
+  now match what native MPS readers such as cuPDLPx solve. Only
+  unmistakable slacks are folded (name prefix + singleton column + zero
+  objective + equality row); when any are, the returned problem has
+  fewer variables than `model.NumVars` -- pass `fold_range_slacks=False`
+  to keep Gurobi's variable layout.
 - r2HPDHG's power iteration starts from cuPDLP-x's exact start vector:
   the first m draws of `std::normal_distribution<double>(0,1)` on
   `std::mt19937(1)` under libstdc++, reproduced bit-for-bit on the host
