@@ -12,8 +12,15 @@ from jax import config
 
 config.update("jax_enable_x64", True)
 
+import numpy as np
+
+from mpax.cupdlpx_random import libstdcxx_normal_draws
 from mpax.mp_io import create_lp
-from mpax.r2hpdhg import r2HPDHG, power_method_sigma_max
+from mpax.r2hpdhg import (
+    cupdlpx_power_iteration_start,
+    power_method_sigma_max,
+    r2HPDHG,
+)
 from mpax.restart import (
     compute_new_primal_weight_cupdlpx,
     update_best_primal_weight,
@@ -37,6 +44,46 @@ def test_power_iteration_default_cap_is_5000():
     sig = inspect.signature(power_method_sigma_max)
     assert sig.parameters["max_iterations"].default == 5000
     assert sig.parameters["tolerance"].default == 1e-4
+
+
+# First draws of `std::mt19937 gen(1); std::normal_distribution<double> dist;`
+# under libstdc++ (g++ 12), printed with %.17g by a reference program; the
+# full 300k-draw prefix was checked bit-for-bit when this was written.
+_LIBSTDCXX_NORMAL_PREFIX = [
+    -0.54974617895544964,
+    -1.4028727091279209,
+    1.5827522919751402,
+    -1.0451468104420223,
+    0.25759354129149009,
+    -1.9593945697470032,
+    -1.5078076853223685,
+    -0.31529208221226868,
+    0.85817887177334062,
+    0.07134298911503105,
+    -2.292309293413727,
+    -1.4155525178875468,
+]
+
+
+def test_libstdcxx_normal_draws_are_bit_exact():
+    # utils.cu estimate_maximum_singular_value: the start vector is the
+    # first m values of that global stream. Exact equality, not approx.
+    draws = libstdcxx_normal_draws(len(_LIBSTDCXX_NORMAL_PREFIX))
+    assert draws.tolist() == _LIBSTDCXX_NORMAL_PREFIX
+    # Longer requests keep the same prefix (chunking must not reorder the
+    # returned/saved halves of each polar pair).
+    assert libstdcxx_normal_draws(5000)[:12].tolist() == _LIBSTDCXX_NORMAL_PREFIX
+    assert libstdcxx_normal_draws(0).size == 0
+
+
+def test_power_iteration_start_vector_is_the_reference_stream():
+    z = np.asarray(cupdlpx_power_iteration_start(12, jnp.float64))
+    assert z.tolist() == _LIBSTDCXX_NORMAL_PREFIX
+    # Also reachable under jit (that is how optimize() runs).
+    import jax
+
+    zj = np.asarray(jax.jit(lambda: cupdlpx_power_iteration_start(12, jnp.float64))())
+    assert zj.tolist() == _LIBSTDCXX_NORMAL_PREFIX
 
 
 def test_pid_primal_weight_update():

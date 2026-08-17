@@ -9,6 +9,7 @@ from jax.experimental import sparse as jsparse
 from jax.experimental.sparse import BCOO, CSR
 from jax.lax import cond
 
+from mpax.cupdlpx_random import libstdcxx_normal_draws
 from mpax.loop_utils import while_loop
 from mpax.preprocess import (
     attach_csr_matrices,
@@ -66,6 +67,20 @@ from mpax.iteration_stats_utils import compute_convergence_information
 logger = logging.getLogger(__name__)
 
 
+def cupdlpx_power_iteration_start(m, dtype):
+    """cuPDLP-x's power-iteration start vector: the first m draws of
+    std::normal_distribution<double>(0,1) on std::mt19937(1) (libstdc++).
+
+    Produced on the host through pure_callback so that under jit the vector
+    is materialized at run time instead of being baked into the executable
+    as an m-element literal (m reaches 3e7 on the Mittelmann set).
+    """
+    return jax.pure_callback(
+        lambda: libstdcxx_normal_draws(m).astype(dtype),
+        jax.ShapeDtypeStruct((m,), dtype),
+    )
+
+
 @jax.jit
 def power_method_sigma_max(matrix, matrix_t, tolerance=1e-4, max_iterations=5000):
     """sigma_max of A by power iteration on A A', stopped on the eigenpair residual.
@@ -73,14 +88,17 @@ def power_method_sigma_max(matrix, matrix_t, tolerance=1e-4, max_iterations=5000
     jitted at module level so repeated solves of same-shaped problems reuse
     the compilation (an eagerly-invoked lax.while_loop recompiles per call).
 
-    Cap and tolerance mirror cuPDLP-x (sv_max_iter=5000, sv_tol=1e-4). The
+    Start vector, cap and tolerance mirror cuPDLP-x (utils.cu
+    estimate_maximum_singular_value: mt19937(1) normal draws, sv_max_iter=5000,
+    sv_tol=1e-4), so the estimate -- and the 0.998/sigma_max step size --
+    agrees with the reference to roundoff. The
     cap matters on ill-separated spectra: power iteration approaches
     sigma_max from below, and an estimate cut short can push
     step * sigma_true past 1 -- a 400-iteration cap left qnet1_o 1.24% low
     and the run diverged. The residual test still exits early (sometimes in
     ~15 iterations) on well-separated problems.
     """
-    z0 = jax.random.normal(jax.random.PRNGKey(1), (matrix.shape[0],)) + 1e-8
+    z0 = cupdlpx_power_iteration_start(matrix.shape[0], matrix.dtype)
 
     def mv(M, v):
         # CSR operands take the cusparse kernel; BCOO/dense use @.

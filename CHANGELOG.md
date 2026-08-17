@@ -14,6 +14,18 @@
   1e-8) — re-baseline before gating.
 
 ### Changed
+- r2HPDHG's power iteration starts from cuPDLP-x's exact start vector:
+  the first m draws of `std::normal_distribution<double>(0,1)` on
+  `std::mt19937(1)` under libstdc++, reproduced bit-for-bit on the host
+  (`mpax/cupdlpx_random.py`, delivered through `pure_callback` so jit
+  does not bake an m-element literal). Structure, cap and tolerance
+  already matched; the start vector was the last difference, and it
+  moved the 0.998/sigma_max step size by ~1e-8 relative -- enough on
+  restart-sensitive instances (physiciansched6-2 at 1e-8: cuPDLPx
+  1.9M iterations, MPAX >8M) to put the two solvers on different
+  trajectories. With the reference start vector the step size agrees
+  to 1 ulp and physiciansched6-2 reproduces cuPDLPx's 1e-4 count
+  (951600) exactly.
 - `optimize()` now reuses its jitted iteration loops across calls:
   the loop closures are cached on the solver instance (invalidated
   when any solver field changes) instead of re-traced and recompiled
