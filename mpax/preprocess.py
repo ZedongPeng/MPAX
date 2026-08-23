@@ -14,7 +14,7 @@ from mpax.solver_log import (
     get_col_l2_norms,
 )
 from mpax.utils import QuadraticProgrammingProblem, ScaledQpProblem
-from jax.experimental.sparse import CSR
+from jax.experimental.sparse import CSR, bcoo_concatenate
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +250,40 @@ def attach_csr_matrices(
     if not replacements:
         return problem
     return dataclasses.replace(problem, **replacements)
+
+
+def attach_stacked_matrix(
+    problem: QuadraticProgrammingProblem,
+) -> QuadraticProgrammingProblem:
+    """Attach the vertical stack [A; Q] used by raPDHG's QP iteration.
+
+    Builds the CSR stack when CSR copies are attached (cusparse path) and
+    the BCOO stack otherwise, so both SpMV backends see the same single
+    launch. LPs and problems without a sparse Q are returned unchanged.
+    """
+    if problem.is_lp or problem.objective_matrix is None:
+        return problem
+    a_csr, q_csr = problem.constraint_matrix_csr, problem.objective_matrix_csr
+    if a_csr is not None and q_csr is not None:
+        num_rows = a_csr.shape[0] + q_csr.shape[0]
+        nnz_a = a_csr.data.shape[0]
+        stacked = CSR(
+            (
+                jnp.concatenate([a_csr.data, q_csr.data]),
+                jnp.concatenate([a_csr.indices, q_csr.indices]),
+                jnp.concatenate([a_csr.indptr, q_csr.indptr[1:] + nnz_a]),
+            ),
+            shape=(num_rows, a_csr.shape[1]),
+        )
+        return dataclasses.replace(problem, stacked_matrix_csr=stacked)
+    if isinstance(problem.constraint_matrix, BCOO) and isinstance(
+        problem.objective_matrix, BCOO
+    ):
+        stacked = bcoo_concatenate(
+            [problem.constraint_matrix, problem.objective_matrix], dimension=0
+        )
+        return dataclasses.replace(problem, stacked_matrix=stacked)
+    return problem
 
 
 def scale_problem(

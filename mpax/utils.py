@@ -134,6 +134,8 @@ class CachedQuadraticProgramInfo(NamedTuple):
         "constraint_matrix_csr",
         "constraint_matrix_t_csr",
         "objective_matrix_csr",
+        "stacked_matrix",
+        "stacked_matrix_csr",
     ],
     meta_fields=["is_lp"],
 )
@@ -201,6 +203,22 @@ class QuadraticProgrammingProblem:
     constraint_matrix_t_csr: Optional[CSR] = None
     # Q is symmetric, so one CSR serves both orientations.
     objective_matrix_csr: Optional[CSR] = None
+    # QP fast path: [A; Q] stacked vertically ((m+n) x n). raPDHG needs
+    # A @ dx and Q @ dx of the same dx every iteration; one SpMV over the
+    # stack replaces two launches (the QP iteration is launch-latency
+    # bound on Maros-Meszaros: ~3.4us per cusparse call regardless of nnz).
+    # Attached by preprocess.attach_stacked_matrix; None otherwise.
+    stacked_matrix: Optional[BCOO] = None
+    stacked_matrix_csr: Optional[CSR] = None
+
+    def has_stacked_matrix(self):
+        return self.stacked_matrix is not None or self.stacked_matrix_csr is not None
+
+    def matvec_stacked(self, v):
+        """[A; Q] @ v as one (m+n)-vector: rows [:m] are A @ v, [m:] are Q @ v."""
+        if self.stacked_matrix_csr is not None:
+            return sparse.csr_matvec(self.stacked_matrix_csr, v)
+        return self.stacked_matrix @ v
 
     def matvec(self, v):
         """A @ v through cusparse when the CSR copy is attached."""

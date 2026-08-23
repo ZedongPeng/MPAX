@@ -631,7 +631,7 @@ class r2HPDHG(raPDHG):
         # Probing that step here (without advancing the iterate) reproduces
         # it exactly: the window's own first step recomputes the same deltas
         # from the same anchor with the same weight.
-        probe_delta_primal, probe_delta_primal_product, probe_delta_dual = (
+        probe_delta_primal, probe_delta_primal_product, probe_delta_dual, _ = (
             compute_next_solution(
                 problem, restarted_solver_state, restarted_solver_state.step_size, 1.0
             )

@@ -10,7 +10,11 @@ from jax.experimental import sparse as jsparse
 from jax.experimental.sparse import BCSR, BCOO, CSR
 
 from mpax.loop_utils import while_loop
-from mpax.preprocess import attach_csr_matrices, rescale_problem
+from mpax.preprocess import (
+    attach_csr_matrices,
+    attach_stacked_matrix,
+    rescale_problem,
+)
 from mpax.restart import (
     run_restart_scheme,
     run_restart_scheme_feasibility_polishing,
@@ -168,7 +172,9 @@ def compute_next_solution(
     Returns
     -------
     tuple
-        The delta primal, delta primal product, and delta dual.
+        The delta primal, delta primal product, delta dual, and delta primal
+        objective product (Q @ delta primal; None unless the problem carries
+        a stacked [A; Q] matrix).
     """
     # Compute the next primal solution.
     # For LPs, momentum is not activated since both avg_primal_obj_product and current_primal_obj_product are zero vectors.
@@ -187,7 +193,16 @@ def compute_next_solution(
         jnp.maximum(problem.variable_lower_bound, next_primal_solution),
     )
     delta_primal = next_primal_solution - solver_state.current_primal_solution
-    delta_primal_product = problem.matvec(delta_primal)
+    if problem.has_stacked_matrix():
+        # One launch for A @ dx and Q @ dx; take_step accumulates Q @ x
+        # incrementally from the latter, the same way A @ x already is.
+        stacked_product = problem.matvec_stacked(delta_primal)
+        num_rows = solver_state.current_dual_solution.shape[0]  # static under jit
+        delta_primal_product = stacked_product[:num_rows]
+        delta_primal_obj_product = stacked_product[num_rows:]
+    else:
+        delta_primal_product = problem.matvec(delta_primal)
+        delta_primal_obj_product = None
 
     # Compute the next dual solution via a single Moreau projection that
     # covers all four row classes (eq / >= / <= / free); see the design
@@ -204,7 +219,12 @@ def compute_next_solution(
         -dual_step * problem.constraint_lower_bound,
     )
     delta_dual_solution = next_dual_solution - solver_state.current_dual_solution
-    return delta_primal, delta_primal_product, delta_dual_solution
+    return (
+        delta_primal,
+        delta_primal_product,
+        delta_dual_solution,
+        delta_primal_obj_product,
+    )
 
 
 def line_search(
@@ -246,7 +266,7 @@ def line_search(
         step_size_limit = line_search_state[4]
         step_size = line_search_state[5]
         line_search_iter += 1
-        delta_primal, delta_primal_product, delta_dual = compute_next_solution(
+        delta_primal, delta_primal_product, delta_dual, _ = compute_next_solution(
             problem, solver_state, step_size, 1.0
         )
         interaction = jnp.abs(jnp.dot(delta_primal_product, delta_dual))
@@ -360,6 +380,14 @@ class raPDHG(abc.ABC):
     # 52us -> 91us per iteration). Set False to stay on the fused XLA
     # kernels when that overhead dominates.
     use_cusparse: bool = True
+    # QP only: fuse A @ dx and Q @ dx into one SpMV over [A; Q] and carry
+    # Q @ x incrementally. Off reproduces the v0.3.3 iteration exactly.
+    stack_objective: bool = True
+    # QP only: run the termination window with the three product-average
+    # updates lagged one iteration into the primal fusion and the scalar
+    # carries packed into one vector, so XLA emits 5 launches per iteration
+    # instead of 8 (needs stack_objective). Same arithmetic, same order.
+    fuse_averages: bool = True
 
     def resolve_config(self, is_lp: bool) -> SolveConfig:
         """Derive the per-solve configuration without mutating the solver.
@@ -675,16 +703,26 @@ class raPDHG(abc.ABC):
                     solver_state.step_size,
                 ),
             )
-            delta_primal, delta_primal_product, delta_dual = compute_next_solution(
+            (
+                delta_primal,
+                delta_primal_product,
+                delta_dual,
+                delta_primal_obj_product,
+            ) = compute_next_solution(
                 problem, solver_state, step_size, extrapolation_coefficient
             )
             line_search_iter = 1
 
         next_primal_solution = solver_state.current_primal_solution + delta_primal
         next_primal_product = solver_state.current_primal_product + delta_primal_product
-        next_primal_obj_product = compute_objective_product(
-            problem, next_primal_solution
-        )
+        if cfg.adaptive_step_size or delta_primal_obj_product is None:
+            next_primal_obj_product = compute_objective_product(
+                problem, next_primal_solution
+            )
+        else:
+            next_primal_obj_product = (
+                solver_state.current_primal_obj_product + delta_primal_obj_product
+            )
         next_dual_solution = solver_state.current_dual_solution + delta_dual
         next_dual_product = problem.matvec_t(next_dual_solution)
 
@@ -753,6 +791,12 @@ class raPDHG(abc.ABC):
         cfg : SolveConfig
             The per-solve configuration derived by `resolve_config`.
         """
+        if (
+            self.fuse_averages
+            and not cfg.adaptive_step_size
+            and problem.has_stacked_matrix()
+        ):
+            return self._take_multiple_steps_fused(solver_state, problem, cfg)
         new_solver_state = jax.lax.fori_loop(
             lower=0,
             upper=self.termination_evaluation_frequency,
@@ -760,6 +804,178 @@ class raPDHG(abc.ABC):
             init_val=solver_state,
         )
         return new_solver_state
+
+    def _take_multiple_steps_fused(
+        self,
+        solver_state: PdhgSolverState,
+        problem: QuadraticProgrammingProblem,
+        cfg: SolveConfig,
+    ) -> PdhgSolverState:
+        """take_multiple_steps for the constant-step QP path, laid out for
+        launch count rather than readability.
+
+        Iteration k of take_step needs Q x_k, avg(Q x)_k and avg(A'y)_k,
+        all of which only become available after the two SpMVs of
+        iteration k-1, so XLA emits their updates as two extra n-vector
+        fusions per iteration. Here those three updates are deferred to
+        the start of iteration k, where they fuse into the primal-step
+        kernel (everything there is n-shaped). The deferral is exact: the
+        expressions and their evaluation order are unchanged, only the
+        kernel they live in moves. The scalar carries ride in one f64[4]
+        so their update is one kernel instead of two. Per iteration:
+        scalars, primal fusion, SpMV [A;Q], dual fusion, SpMV A'.
+        """
+        s = solver_state
+        num_rows = s.current_dual_solution.shape[0]
+        # [solutions_count, weights_sum, step_size, ratio of the previous
+        # iteration]; ratio_prev = 0 and an all-zero pending Q dx make the
+        # first deferred update a no-op.
+        dtype = jnp.result_type(s.step_size)
+        scalars = jnp.stack(
+            [
+                jnp.asarray(s.solutions_count, dtype=dtype),
+                jnp.asarray(s.weights_sum, dtype=dtype),
+                jnp.asarray(s.step_size, dtype=dtype),
+                jnp.zeros((), dtype=dtype),
+            ]
+        )
+        carry = (
+            s.current_primal_solution,
+            s.current_dual_solution,
+            s.current_primal_product,
+            s.current_dual_product,
+            s.current_primal_obj_product,
+            s.avg_primal_solution,
+            s.avg_dual_solution,
+            s.avg_primal_product,
+            s.avg_dual_product,
+            s.avg_primal_obj_product,
+            jnp.zeros_like(s.current_primal_obj_product),  # pending Q dx
+            s.delta_primal,
+            s.delta_dual,
+            s.delta_primal_product,
+            scalars,
+        )
+
+        def apply_deferred(obj_product, avg_obj_product, avg_dual_product,
+                           dual_product, pending_obj, ratio_prev):
+            obj_product = obj_product + pending_obj
+            avg_obj_product = avg_obj_product + ratio_prev * (
+                obj_product - avg_obj_product
+            )
+            avg_dual_product = avg_dual_product + ratio_prev * (
+                dual_product - avg_dual_product
+            )
+            return obj_product, avg_obj_product, avg_dual_product
+
+        def body(_, carry):
+            (
+                primal, dual, primal_product, dual_product, obj_product,
+                avg_primal, avg_dual, avg_primal_product, avg_dual_product,
+                avg_obj_product, pending_obj, _dp, _dd, _dpp, scalars,
+            ) = carry
+            count, weights_sum, last_step_size, ratio_prev = (
+                scalars[0], scalars[1], scalars[2], scalars[3]
+            )
+            # Scalars (one kernel): same formulas as take_step.
+            step_size = self.calculate_constant_step_size(
+                s.primal_weight, count, last_step_size
+            )
+            new_weights_sum = weights_sum + step_size
+            ratio = step_size / new_weights_sum
+            momentum_coef = 1 / (1.0 + count / 2.0)
+            extrapolation_coefficient = count / (count + 1.0)
+            new_scalars = jnp.stack([count + 1, new_weights_sum, step_size, ratio])
+
+            # Primal fusion: deferred averages, then compute_next_solution's
+            # primal half and the primal average.
+            obj_product, avg_obj_product, avg_dual_product = apply_deferred(
+                obj_product, avg_obj_product, avg_dual_product,
+                dual_product, pending_obj, ratio_prev,
+            )
+            next_primal = primal - (step_size / s.primal_weight) * (
+                problem.objective_vector
+                - dual_product
+                + (1 - momentum_coef) * avg_obj_product
+                + momentum_coef * obj_product
+            )
+            next_primal = jnp.minimum(
+                problem.variable_upper_bound,
+                jnp.maximum(problem.variable_lower_bound, next_primal),
+            )
+            delta_primal = next_primal - primal
+            next_avg_primal = avg_primal + ratio * (next_primal - avg_primal)
+
+            stacked_product = problem.matvec_stacked(delta_primal)
+            delta_primal_product = stacked_product[:num_rows]
+            delta_obj_product = stacked_product[num_rows:]
+
+            # Dual fusion: compute_next_solution's dual half + m-shaped
+            # state updates.
+            dual_step = s.primal_weight * step_size
+            next_dual_candidate = dual - dual_step * (
+                (1 + extrapolation_coefficient) * delta_primal_product
+                + primal_product
+            )
+            next_dual = next_dual_candidate - jnp.clip(
+                next_dual_candidate,
+                -dual_step * problem.constraint_upper_bound,
+                -dual_step * problem.constraint_lower_bound,
+            )
+            delta_dual = next_dual - dual
+            next_primal_product = primal_product + delta_primal_product
+            next_avg_dual = avg_dual + ratio * (next_dual - avg_dual)
+            next_avg_primal_product = avg_primal_product + ratio * (
+                next_primal_product - avg_primal_product
+            )
+
+            next_dual_product = problem.matvec_t(next_dual)
+            return (
+                next_primal, next_dual, next_primal_product, next_dual_product,
+                obj_product, next_avg_primal, next_avg_dual,
+                next_avg_primal_product, avg_dual_product, avg_obj_product,
+                delta_obj_product, delta_primal, delta_dual,
+                delta_primal_product, new_scalars,
+            )
+
+        steps = self.termination_evaluation_frequency
+        (
+            primal, dual, primal_product, dual_product, obj_product,
+            avg_primal, avg_dual, avg_primal_product, avg_dual_product,
+            avg_obj_product, pending_obj, delta_primal, delta_dual,
+            delta_primal_product, scalars,
+        ) = jax.lax.fori_loop(0, steps, body, carry)
+        obj_product, avg_obj_product, avg_dual_product = apply_deferred(
+            obj_product, avg_obj_product, avg_dual_product,
+            dual_product, pending_obj, scalars[3],
+        )
+        return PdhgSolverState(
+            current_primal_solution=primal,
+            current_dual_solution=dual,
+            current_primal_product=primal_product,
+            current_dual_product=dual_product,
+            current_primal_obj_product=obj_product,
+            avg_primal_solution=avg_primal,
+            avg_dual_solution=avg_dual,
+            avg_primal_product=avg_primal_product,
+            avg_dual_product=avg_dual_product,
+            avg_primal_obj_product=avg_obj_product,
+            initial_primal_solution=s.initial_primal_solution,
+            initial_dual_solution=s.initial_dual_solution,
+            initial_primal_product=s.initial_primal_product,
+            initial_dual_product=s.initial_dual_product,
+            delta_primal=delta_primal,
+            delta_dual=delta_dual,
+            delta_primal_product=delta_primal_product,
+            solutions_count=s.solutions_count + steps,
+            weights_sum=scalars[1],
+            step_size=scalars[2],
+            primal_weight=s.primal_weight,
+            numerical_error=False,
+            num_steps_tried=s.num_steps_tried + steps,
+            num_iterations=s.num_iterations + steps,
+            termination_status=TerminationStatus.UNSPECIFIED,
+        )
 
     def initial_iteration_update(
         self,
@@ -1127,6 +1343,10 @@ class raPDHG(abc.ABC):
         if self.use_cusparse:
             scaled_problem = scaled_problem._replace(
                 scaled_qp=attach_csr_matrices(scaled_problem.scaled_qp)
+            )
+        if self.stack_objective and not original_problem.is_lp:
+            scaled_problem = scaled_problem._replace(
+                scaled_qp=attach_stacked_matrix(scaled_problem.scaled_qp)
             )
         precondition_time = timeit.default_timer() - precondition_start_time
         logger.info("Preconditioning Time (seconds): %.2e", precondition_time)
