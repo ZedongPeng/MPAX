@@ -283,6 +283,15 @@ def attach_stacked_matrix(
             [problem.constraint_matrix, problem.objective_matrix], dimension=0
         )
         return dataclasses.replace(problem, stacked_matrix=stacked)
+    if isinstance(problem.constraint_matrix, jnp.ndarray) and isinstance(
+        problem.objective_matrix, jnp.ndarray
+    ):
+        # Dense path (use_sparse_matrix=False): one cublas GEMV over the
+        # vertical stack replaces the separate A dx and Q dx products.
+        stacked = jnp.concatenate(
+            [problem.constraint_matrix, problem.objective_matrix], axis=0
+        )
+        return dataclasses.replace(problem, stacked_matrix=stacked)
     return problem
 
 
